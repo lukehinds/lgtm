@@ -95,6 +95,7 @@ async fn main() -> Result<()> {
             "github.poll_interval_seconds = {}",
             config.github.poll_interval_seconds
         );
+        println!("ui.columns = {}", config.ui.columns.join(", "));
         return Ok(());
     }
 
@@ -124,6 +125,7 @@ async fn main() -> Result<()> {
             poll_interval_seconds: config.github.poll_interval_seconds,
             config_paths: config.loaded_paths,
             watch_paths: config.watch.paths,
+            columns: config.ui.columns,
         },
         client,
     )

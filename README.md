@@ -30,9 +30,16 @@ Or set defaults in a config file (see below) and just run `wftt`.
 | `Enter` | Open PR / issue detail and run AI analysis |
 | `Tab` | Switch between Pull Requests and Issues |
 | `r` | Refresh from GitHub |
-| `s` | Toggle sort (PRs: smart / recently updated; Issues: newest / oldest) |
+| `s` | Cycle sort mode |
+| `f` | Cycle cache filter (all / cached / uncached) |
+| `/` | Search current list/detail/diff text |
+| `x` | Clear search and filters |
+| `o` | Open selected PR / issue in GitHub |
 | `d` | View diff (from PR detail) |
 | `c` | Copy AI review to clipboard |
+| `v` | Copy summary / overview from detail screens |
+| `n` / `p` | Next / previous file in diff viewer |
+| `]` / `[` | Next / previous hunk in diff viewer |
 | `i` | Runtime info |
 | `?` | Help |
 | `q q` | Quit |
@@ -51,6 +58,9 @@ repo = "owner/repo"
 provider = "gemini"
 model = "gemini-2.0-flash"
 api_key_env = "GEMINI_API_KEY"
+
+[ui]
+columns = ["title", "author", "age", "label"]
 ```
 
 Supported providers: `openai`, `gemini`, `anthropic`, or any OpenAI-compatible endpoint via `base_url`.

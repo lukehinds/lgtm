@@ -59,12 +59,36 @@ pub struct AppConfig {
     pub poll_interval_seconds: u64,
     pub config_paths: Vec<PathBuf>,
     pub watch_paths: Vec<WatchedPathConfig>,
+    pub columns: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
     PullRequests,
     Issues,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrSort {
+    Smart,
+    Newest,
+    Oldest,
+    Smallest,
+    Largest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssueSort {
+    Newest,
+    Oldest,
+    Author,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheFilter {
+    All,
+    Cached,
+    Uncached,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +101,19 @@ enum Screen {
     PrDetail,
     IssueDetail,
     Diff,
+}
+
+#[derive(Debug, Clone)]
+struct DiffFile {
+    old_path: String,
+    new_path: String,
+    start_line: usize,
+}
+
+#[derive(Debug, Clone)]
+struct DiffHunk {
+    file_index: usize,
+    start_line: usize,
 }
 
 enum DetailLoadResult {
@@ -105,8 +142,11 @@ struct State {
     issue_total: u64,
     selected_pr: usize,
     selected_issue: usize,
-    issue_newest: bool,
-    pr_smart_sort: bool,
+    pr_sort: PrSort,
+    issue_sort: IssueSort,
+    cache_filter: CacheFilter,
+    search_query: String,
+    search_input: bool,
     status: String,
     pr_detail: Option<PrDetail>,
     pr_analysis: Option<PrAnalysis>,
@@ -120,6 +160,8 @@ struct State {
     pr_detail_scroll: u16,
     issue_detail_scroll: u16,
     diff_scroll: u16,
+    diff_file_index: usize,
+    diff_hunk_index: usize,
     quit_armed: bool,
 }
 
@@ -162,8 +204,11 @@ impl State {
             issue_total: 0,
             selected_pr: 0,
             selected_issue: 0,
-            issue_newest: true,
-            pr_smart_sort: true,
+            pr_sort: PrSort::Smart,
+            issue_sort: IssueSort::Newest,
+            cache_filter: CacheFilter::All,
+            search_query: String::new(),
+            search_input: false,
             status: "Loading repository data...".to_string(),
             pr_detail: None,
             pr_analysis: None,
@@ -177,15 +222,27 @@ impl State {
             pr_detail_scroll: 0,
             issue_detail_scroll: 0,
             diff_scroll: 0,
+            diff_file_index: 0,
+            diff_hunk_index: 0,
             quit_armed: false,
         }
     }
 
     fn apply_pr_sort(&self, prs: &mut Vec<PrData>) {
-        if self.pr_smart_sort {
-            sorting::sort_prs(prs);
-        } else {
-            prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        match self.pr_sort {
+            PrSort::Smart => sorting::sort_prs(prs),
+            PrSort::Newest => prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)),
+            PrSort::Oldest => prs.sort_by(|a, b| a.updated_at.cmp(&b.updated_at)),
+            PrSort::Smallest => prs.sort_by_key(PrData::lines_changed),
+            PrSort::Largest => prs.sort_by_key(|pr| std::cmp::Reverse(pr.lines_changed())),
+        }
+    }
+
+    fn apply_issue_sort(&self, issues: &mut Vec<IssueData>) {
+        match self.issue_sort {
+            IssueSort::Newest => issues.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
+            IssueSort::Oldest => issues.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
+            IssueSort::Author => issues.sort_by(|a, b| a.author.cmp(&b.author)),
         }
     }
 
@@ -228,15 +285,20 @@ impl State {
     }
 
     async fn load_issues(&mut self, force: bool) {
-        let direction = if self.issue_newest { "desc" } else { "asc" };
+        let direction = if self.issue_sort == IssueSort::Oldest {
+            "asc"
+        } else {
+            "desc"
+        };
         if !force {
-            if let Some((issues, total)) = cache::get_cached_issue_list(
+            if let Some((mut issues, total)) = cache::get_cached_issue_list(
                 &self.config.cache,
                 &self.config.repo,
                 self.issue_page,
                 direction,
                 Some(Duration::from_secs(self.config.cache_ttl_seconds)),
             ) {
+                self.apply_issue_sort(&mut issues);
                 self.issues = issues;
                 self.issue_total = total;
                 return;
@@ -249,6 +311,7 @@ impl State {
             .await
         {
             Ok((issues, total)) => {
+                let mut issues = issues;
                 cache::save_issue_list(
                     &self.config.cache,
                     &self.config.repo,
@@ -257,6 +320,7 @@ impl State {
                     total,
                     direction,
                 );
+                self.apply_issue_sort(&mut issues);
                 self.issues = issues;
                 self.issue_total = total;
                 self.selected_issue = self.selected_issue.min(self.issues.len().saturating_sub(1));
@@ -282,6 +346,8 @@ impl State {
                 self.load_error = None;
                 self.pr_detail_scroll = 0;
                 self.diff_scroll = 0;
+                self.diff_file_index = 0;
+                self.diff_hunk_index = 0;
                 let client = self.client.clone();
                 let config = self.config.clone();
                 let (phase_tx, phase_rx) = mpsc::unbounded_channel();
@@ -342,6 +408,8 @@ impl State {
                 self.pr_analysis = Some(analysis);
                 self.pr_detail_scroll = 0;
                 self.diff_scroll = 0;
+                self.diff_file_index = 0;
+                self.diff_hunk_index = 0;
                 self.screen = Screen::PrDetail;
                 self.status = status;
             }
@@ -501,6 +569,29 @@ async fn run_loop(
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        if state.search_input {
+            match key.code {
+                KeyCode::Esc => {
+                    state.search_input = false;
+                    state.status = "Search cancelled".to_string();
+                }
+                KeyCode::Enter => {
+                    state.search_input = false;
+                    jump_to_search_match(state);
+                    state.status = search_status(state);
+                }
+                KeyCode::Backspace => {
+                    state.search_query.pop();
+                    state.status = format!("Search: {}", state.search_query);
+                }
+                KeyCode::Char(c) => {
+                    state.search_query.push(c);
+                    state.status = format!("Search: {}", state.search_query);
+                }
+                _ => {}
+            }
+            continue;
+        }
         match state.screen {
             Screen::List => match key.code {
                 KeyCode::Char('q') => {
@@ -513,6 +604,9 @@ async fn run_loop(
                 KeyCode::Char('?') => state.screen = Screen::Help,
                 KeyCode::Char('i') => state.screen = Screen::Info,
                 KeyCode::Char('o') => open_selected_in_browser(state),
+                KeyCode::Char('/') => start_search(state),
+                KeyCode::Char('x') => clear_search_and_filter(state),
+                KeyCode::Char('f') => cycle_cache_filter(state),
                 KeyCode::Tab => {
                     state.tab = if state.tab == Tab::PullRequests {
                         Tab::Issues
@@ -521,28 +615,18 @@ async fn run_loop(
                     };
                     state.quit_armed = false;
                 }
-                KeyCode::Char('s') if state.tab == Tab::Issues => {
-                    state.issue_newest = !state.issue_newest;
-                    state.issue_page = 0;
-                    state.load_issues(true).await;
-                }
+                KeyCode::Char('s') => cycle_sort(state).await,
                 KeyCode::Char('r') => match state.tab {
                     Tab::PullRequests => state.load_prs(true).await,
                     Tab::Issues => state.load_issues(true).await,
                 },
                 KeyCode::Down => match state.tab {
-                    Tab::PullRequests => {
-                        state.selected_pr =
-                            (state.selected_pr + 1).min(state.prs.len().saturating_sub(1))
-                    }
-                    Tab::Issues => {
-                        state.selected_issue =
-                            (state.selected_issue + 1).min(state.issues.len().saturating_sub(1))
-                    }
+                    Tab::PullRequests => move_list_selection(state, 1),
+                    Tab::Issues => move_list_selection(state, 1),
                 },
                 KeyCode::Up => match state.tab {
-                    Tab::PullRequests => state.selected_pr = state.selected_pr.saturating_sub(1),
-                    Tab::Issues => state.selected_issue = state.selected_issue.saturating_sub(1),
+                    Tab::PullRequests => move_list_selection(state, -1),
+                    Tab::Issues => move_list_selection(state, -1),
                 },
                 KeyCode::Right => match state.tab {
                     Tab::PullRequests if ((state.pr_page + 1) * 15) < state.pr_total as usize => {
@@ -617,6 +701,8 @@ async fn run_loop(
                 KeyCode::Esc => state.screen = Screen::List,
                 KeyCode::Char('d') => state.screen = Screen::Diff,
                 KeyCode::Char('o') => open_selected_in_browser(state),
+                KeyCode::Char('/') => start_search(state),
+                KeyCode::Char('n') => search_next_in_detail(state),
                 KeyCode::Down => scroll_down(&mut state.pr_detail_scroll, 1),
                 KeyCode::Up => scroll_up(&mut state.pr_detail_scroll, 1),
                 KeyCode::PageDown => scroll_down(&mut state.pr_detail_scroll, 10),
@@ -627,6 +713,14 @@ async fn run_loop(
                         .pr_analysis
                         .as_ref()
                         .map(|a| a.review_comment.as_str())
+                        .unwrap_or(""),
+                    &mut state.status,
+                ),
+                KeyCode::Char('v') => copy_text(
+                    state
+                        .pr_analysis
+                        .as_ref()
+                        .map(|a| a.summary.as_str())
                         .unwrap_or(""),
                     &mut state.status,
                 ),
@@ -642,6 +736,8 @@ async fn run_loop(
             Screen::IssueDetail => match key.code {
                 KeyCode::Esc => state.screen = Screen::List,
                 KeyCode::Char('o') => open_selected_in_browser(state),
+                KeyCode::Char('/') => start_search(state),
+                KeyCode::Char('n') => search_next_in_detail(state),
                 KeyCode::Down => scroll_down(&mut state.issue_detail_scroll, 1),
                 KeyCode::Up => scroll_up(&mut state.issue_detail_scroll, 1),
                 KeyCode::PageDown => scroll_down(&mut state.issue_detail_scroll, 10),
@@ -652,6 +748,14 @@ async fn run_loop(
                         .issue_analysis
                         .as_ref()
                         .map(|a| a.suggested_fix.as_str())
+                        .unwrap_or(""),
+                    &mut state.status,
+                ),
+                KeyCode::Char('v') => copy_text(
+                    state
+                        .issue_analysis
+                        .as_ref()
+                        .map(|a| a.overview.as_str())
                         .unwrap_or(""),
                     &mut state.status,
                 ),
@@ -666,11 +770,16 @@ async fn run_loop(
             },
             Screen::Diff => match key.code {
                 KeyCode::Esc => state.screen = Screen::PrDetail,
+                KeyCode::Char('/') => start_search(state),
                 KeyCode::Down => scroll_down(&mut state.diff_scroll, 1),
                 KeyCode::Up => scroll_up(&mut state.diff_scroll, 1),
                 KeyCode::PageDown => scroll_down(&mut state.diff_scroll, 10),
                 KeyCode::PageUp => scroll_up(&mut state.diff_scroll, 10),
                 KeyCode::Home => state.diff_scroll = 0,
+                KeyCode::Char('n') => jump_diff_file(state, 1),
+                KeyCode::Char('p') => jump_diff_file(state, -1),
+                KeyCode::Char(']') => jump_diff_hunk(state, 1),
+                KeyCode::Char('[') => jump_diff_hunk(state, -1),
                 KeyCode::Char('q') => {
                     if state.quit_armed {
                         break;
@@ -704,7 +813,9 @@ fn render(frame: &mut Frame<'_>, state: &mut State) {
         .map(|title| {
             Line::from(Span::styled(
                 title,
-                Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(TEXT_SECONDARY)
+                    .add_modifier(Modifier::BOLD),
             ))
         })
         .collect::<Vec<_>>();
@@ -790,6 +901,9 @@ fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
             ("Tab", "switch"),
             ("r", "refresh"),
             ("s", "sort"),
+            ("f", "filter"),
+            ("/", "search"),
+            ("x", "clear"),
             ("o", "github"),
             ("i", "info"),
             ("?", "help"),
@@ -800,6 +914,9 @@ fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
             ("Tab", "switch"),
             ("r", "refresh"),
             ("s", "newest/oldest"),
+            ("f", "filter"),
+            ("/", "search"),
+            ("x", "clear"),
             ("o", "github"),
             ("?", "help"),
             ("q q", "quit"),
@@ -808,6 +925,7 @@ fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
             ("Up/Down", "scroll"),
             ("d", "diff"),
             ("c", "copy review"),
+            ("v", "copy summary"),
             ("o", "github"),
             ("Esc", "back"),
             ("q q", "quit"),
@@ -815,11 +933,18 @@ fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
         Screen::IssueDetail => hint_spans(&[
             ("Up/Down", "scroll"),
             ("c", "copy fix"),
+            ("v", "copy overview"),
             ("o", "github"),
             ("Esc", "back"),
             ("q q", "quit"),
         ]),
-        Screen::Diff => hint_spans(&[("Up/Down", "scroll"), ("Esc", "back"), ("q q", "quit")]),
+        Screen::Diff => hint_spans(&[
+            ("Up/Down", "scroll"),
+            ("n/p", "file"),
+            ("[/]", "hunk"),
+            ("Esc", "back"),
+            ("q q", "quit"),
+        ]),
         Screen::Loading => hint_spans(&[("Esc", "cancel"), ("q q", "quit")]),
         Screen::Error => hint_spans(&[("r", "retry"), ("Esc", "back"), ("q q", "quit")]),
         Screen::Help | Screen::Info => hint_spans(&[("Esc", "close")]),
@@ -844,26 +969,37 @@ fn render_list(frame: &mut Frame<'_>, state: &mut State, area: ratatui::layout::
     match state.tab {
         Tab::PullRequests => {
             let provider = resolved_provider(&state.config);
-            let items = state
-                .prs
+            let visible = visible_pr_indices(state, &provider);
+            if !visible.contains(&state.selected_pr) {
+                if let Some(first) = visible.first() {
+                    state.selected_pr = *first;
+                }
+            }
+            let items = visible
                 .iter()
-                .map(|pr| {
+                .map(|index| {
+                    let pr = &state.prs[*index];
                     pr_item(
                         pr,
                         &state.config.watch_paths,
                         pr_has_cached_analysis(state, pr, &provider),
+                        &state.config.columns,
                     )
                 })
                 .collect::<Vec<_>>();
+            let selected_row = visible.iter().position(|index| *index == state.selected_pr);
             state
                 .pr_list_state
-                .select((!items.is_empty()).then_some(state.selected_pr));
+                .select((!items.is_empty()).then_some(selected_row.unwrap_or(0)));
             let total_pages = pages(state.pr_total);
             let title = format!(
-                " Pull Requests  page {} / {}  total {} ",
+                " Pull Requests  page {} / {}  total {}  showing {}  {}  {}  C=cached ",
                 state.pr_page + 1,
                 total_pages,
-                state.pr_total
+                state.pr_total,
+                visible.len(),
+                pr_sort_label(state.pr_sort),
+                filter_label(state.cache_filter),
             );
             if items.is_empty() {
                 render_empty_state(
@@ -891,24 +1027,37 @@ fn render_list(frame: &mut Frame<'_>, state: &mut State, area: ratatui::layout::
         }
         Tab::Issues => {
             let provider = resolved_provider(&state.config);
-            let items = state
-                .issues
+            let visible = visible_issue_indices(state, &provider);
+            if !visible.contains(&state.selected_issue) {
+                if let Some(first) = visible.first() {
+                    state.selected_issue = *first;
+                }
+            }
+            let items = visible
                 .iter()
-                .map(|issue| issue_item(issue, issue_has_cached_analysis(state, issue, &provider)))
+                .map(|index| {
+                    let issue = &state.issues[*index];
+                    issue_item(
+                        issue,
+                        issue_has_cached_analysis(state, issue, &provider),
+                        &state.config.columns,
+                    )
+                })
                 .collect::<Vec<_>>();
+            let selected_row = visible
+                .iter()
+                .position(|index| *index == state.selected_issue);
             state
                 .issue_list_state
-                .select((!items.is_empty()).then_some(state.selected_issue));
-            let order = if state.issue_newest {
-                "Newest first"
-            } else {
-                "Oldest first"
-            };
+                .select((!items.is_empty()).then_some(selected_row.unwrap_or(0)));
             let title = format!(
-                " Issues  {order}  page {} / {}  total {} ",
+                " Issues  {}  page {} / {}  total {}  showing {}  {}  C=cached ",
+                issue_sort_label(state.issue_sort),
                 state.issue_page + 1,
                 pages(state.issue_total),
-                state.issue_total
+                state.issue_total,
+                visible.len(),
+                filter_label(state.cache_filter),
             );
             if items.is_empty() {
                 render_empty_state(
@@ -935,6 +1084,59 @@ fn render_list(frame: &mut Frame<'_>, state: &mut State, area: ratatui::layout::
             }
         }
     }
+}
+
+fn visible_pr_indices(state: &State, provider: &ai::ProviderConfig) -> Vec<usize> {
+    state
+        .prs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, pr)| {
+            let cached = pr_has_cached_analysis(state, pr, provider);
+            let labels = pr.labels.join(" ");
+            item_visible(
+                cached,
+                state.cache_filter,
+                &state.search_query,
+                &[&pr.title, &pr.author, &pr.body, &labels],
+            )
+            .then_some(index)
+        })
+        .collect()
+}
+
+fn visible_issue_indices(state: &State, provider: &ai::ProviderConfig) -> Vec<usize> {
+    state
+        .issues
+        .iter()
+        .enumerate()
+        .filter_map(|(index, issue)| {
+            let cached = issue_has_cached_analysis(state, issue, provider);
+            item_visible(
+                cached,
+                state.cache_filter,
+                &state.search_query,
+                &[&issue.title, &issue.author, &issue.body, &issue.label_raw],
+            )
+            .then_some(index)
+        })
+        .collect()
+}
+
+fn item_visible(cached: bool, filter: CacheFilter, query: &str, fields: &[&str]) -> bool {
+    let cache_ok = match filter {
+        CacheFilter::All => true,
+        CacheFilter::Cached => cached,
+        CacheFilter::Uncached => !cached,
+    };
+    if !cache_ok {
+        return false;
+    }
+    let query = query.trim().to_lowercase();
+    query.is_empty()
+        || fields
+            .iter()
+            .any(|field| field.to_lowercase().contains(&query))
 }
 
 fn pr_has_cached_analysis(state: &State, pr: &PrData, provider: &ai::ProviderConfig) -> bool {
@@ -1064,19 +1266,19 @@ fn render_error(frame: &mut Frame<'_>, state: &State, area: Rect) {
     );
 }
 
-fn render_scrollable_text(
+fn render_scrollable_lines(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
-    text: String,
+    lines: Vec<Line<'static>>,
     scroll: &mut u16,
 ) {
-    let line_count = text.lines().count();
+    let line_count = lines.len();
     let viewport = area.height.saturating_sub(2) as usize;
     let max_scroll = line_count.saturating_sub(viewport);
     *scroll = (*scroll).min(max_scroll.min(u16::MAX as usize) as u16);
     frame.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(Text::from(lines))
             .block(Block::default().title(title).borders(Borders::ALL))
             .wrap(Wrap { trim: false })
             .scroll((*scroll, 0)),
@@ -1128,6 +1330,355 @@ fn scroll_up(scroll: &mut u16, amount: u16) {
     *scroll = scroll.saturating_sub(amount);
 }
 
+fn move_list_selection(state: &mut State, delta: isize) {
+    let provider = resolved_provider(&state.config);
+    match state.tab {
+        Tab::PullRequests => {
+            let visible = visible_pr_indices(state, &provider);
+            if visible.is_empty() {
+                return;
+            }
+            let row = visible
+                .iter()
+                .position(|index| *index == state.selected_pr)
+                .unwrap_or(0);
+            state.selected_pr = visible[offset_index(row, delta, visible.len() - 1)];
+        }
+        Tab::Issues => {
+            let visible = visible_issue_indices(state, &provider);
+            if visible.is_empty() {
+                return;
+            }
+            let row = visible
+                .iter()
+                .position(|index| *index == state.selected_issue)
+                .unwrap_or(0);
+            state.selected_issue = visible[offset_index(row, delta, visible.len() - 1)];
+        }
+    }
+}
+
+fn start_search(state: &mut State) {
+    state.search_input = true;
+    state.status = if state.search_query.is_empty() {
+        "Search: ".to_string()
+    } else {
+        format!("Search: {}", state.search_query)
+    };
+}
+
+fn clear_search_and_filter(state: &mut State) {
+    state.search_query.clear();
+    state.cache_filter = CacheFilter::All;
+    state.status = "Search and filters cleared".to_string();
+}
+
+fn cycle_cache_filter(state: &mut State) {
+    state.cache_filter = match state.cache_filter {
+        CacheFilter::All => CacheFilter::Cached,
+        CacheFilter::Cached => CacheFilter::Uncached,
+        CacheFilter::Uncached => CacheFilter::All,
+    };
+    state.status = format!("Filter: {}", filter_label(state.cache_filter));
+}
+
+async fn cycle_sort(state: &mut State) {
+    match state.tab {
+        Tab::PullRequests => {
+            state.pr_sort = match state.pr_sort {
+                PrSort::Smart => PrSort::Newest,
+                PrSort::Newest => PrSort::Oldest,
+                PrSort::Oldest => PrSort::Smallest,
+                PrSort::Smallest => PrSort::Largest,
+                PrSort::Largest => PrSort::Smart,
+            };
+            let mut prs = std::mem::take(&mut state.prs);
+            state.apply_pr_sort(&mut prs);
+            state.prs = prs;
+            state.status = format!("PR sort: {}", pr_sort_label(state.pr_sort));
+        }
+        Tab::Issues => {
+            state.issue_sort = match state.issue_sort {
+                IssueSort::Newest => IssueSort::Oldest,
+                IssueSort::Oldest => IssueSort::Author,
+                IssueSort::Author => IssueSort::Newest,
+            };
+            state.issue_page = 0;
+            state.load_issues(true).await;
+            state.status = format!("Issue sort: {}", issue_sort_label(state.issue_sort));
+        }
+    }
+}
+
+fn search_status(state: &State) -> String {
+    if state.search_query.trim().is_empty() {
+        "Search cleared".to_string()
+    } else {
+        format!("Search: {}", state.search_query)
+    }
+}
+
+fn jump_to_search_match(state: &mut State) {
+    if state.search_query.trim().is_empty() {
+        return;
+    }
+    match state.screen {
+        Screen::List => {}
+        Screen::PrDetail | Screen::IssueDetail | Screen::Diff => search_next_in_detail(state),
+        _ => {}
+    }
+}
+
+fn search_next_in_detail(state: &mut State) {
+    let query = state.search_query.trim().to_lowercase();
+    if query.is_empty() {
+        state.status = "No search query".to_string();
+        return;
+    }
+    let (text, scroll) = match state.screen {
+        Screen::PrDetail => (pr_detail_text(state), &mut state.pr_detail_scroll),
+        Screen::IssueDetail => (issue_detail_text(state), &mut state.issue_detail_scroll),
+        Screen::Diff => (
+            state
+                .pr_detail
+                .as_ref()
+                .map(|detail| detail.diff.clone())
+                .unwrap_or_default(),
+            &mut state.diff_scroll,
+        ),
+        _ => return,
+    };
+    let start = (*scroll as usize).saturating_add(1);
+    if let Some(index) =
+        find_line_after(&text, &query, start).or_else(|| find_line_after(&text, &query, 0))
+    {
+        *scroll = index.min(u16::MAX as usize) as u16;
+        state.status = format!("Match {} for {}", index + 1, state.search_query);
+    } else {
+        state.status = format!("No match for {}", state.search_query);
+    }
+}
+
+fn find_line_after(text: &str, query: &str, start: usize) -> Option<usize> {
+    text.lines()
+        .enumerate()
+        .skip(start)
+        .find(|(_, line)| line.to_lowercase().contains(query))
+        .map(|(index, _)| index)
+}
+
+fn pr_sort_label(sort: PrSort) -> &'static str {
+    match sort {
+        PrSort::Smart => "smart",
+        PrSort::Newest => "newest",
+        PrSort::Oldest => "oldest",
+        PrSort::Smallest => "smallest",
+        PrSort::Largest => "largest",
+    }
+}
+
+fn issue_sort_label(sort: IssueSort) -> &'static str {
+    match sort {
+        IssueSort::Newest => "newest",
+        IssueSort::Oldest => "oldest",
+        IssueSort::Author => "author",
+    }
+}
+
+fn filter_label(filter: CacheFilter) -> &'static str {
+    match filter {
+        CacheFilter::All => "all",
+        CacheFilter::Cached => "cached",
+        CacheFilter::Uncached => "uncached",
+    }
+}
+
+fn jump_diff_file(state: &mut State, delta: isize) {
+    let Some(detail) = state.pr_detail.as_ref() else {
+        return;
+    };
+    let (_, files, hunks) = parse_diff(&detail.diff);
+    if files.is_empty() {
+        return;
+    }
+    let max = files.len().saturating_sub(1);
+    let next = offset_index(state.diff_file_index, delta, max);
+    state.diff_file_index = next;
+    state.diff_hunk_index = hunks
+        .iter()
+        .position(|hunk| hunk.file_index == next)
+        .unwrap_or(state.diff_hunk_index);
+    state.diff_scroll = files[next].start_line.min(u16::MAX as usize) as u16;
+}
+
+fn jump_diff_hunk(state: &mut State, delta: isize) {
+    let Some(detail) = state.pr_detail.as_ref() else {
+        return;
+    };
+    let (_, files, hunks) = parse_diff(&detail.diff);
+    if hunks.is_empty() {
+        return;
+    }
+    let max = hunks.len().saturating_sub(1);
+    let next = offset_index(state.diff_hunk_index, delta, max);
+    state.diff_hunk_index = next;
+    state.diff_file_index = hunks[next].file_index;
+    state.diff_scroll = hunks[next].start_line.min(u16::MAX as usize) as u16;
+    if state.diff_file_index >= files.len() {
+        state.diff_file_index = files.len().saturating_sub(1);
+    }
+}
+
+fn sync_diff_position(state: &mut State, files: &[DiffFile], hunks: &[DiffHunk]) {
+    let scroll = state.diff_scroll as usize;
+    if let Some((index, _)) = files
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, file)| file.start_line <= scroll)
+    {
+        state.diff_file_index = index;
+    }
+    if let Some((index, _)) = hunks
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, hunk)| hunk.start_line <= scroll)
+    {
+        state.diff_hunk_index = index;
+    }
+}
+
+fn offset_index(current: usize, delta: isize, max: usize) -> usize {
+    if delta.is_negative() {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as usize).min(max)
+    }
+}
+
+fn parse_diff(diff: &str) -> (Vec<Line<'static>>, Vec<DiffFile>, Vec<DiffHunk>) {
+    let mut lines = Vec::new();
+    let mut files = Vec::new();
+    let mut hunks = Vec::new();
+    let mut current_file: Option<usize> = None;
+    let mut pending_old_path: Option<String> = None;
+
+    for raw_line in diff.lines() {
+        let line_index = lines.len();
+        if let Some(rest) = raw_line.strip_prefix("diff --git ") {
+            let (old_path, new_path) = parse_diff_git_paths(rest);
+            files.push(DiffFile {
+                old_path,
+                new_path,
+                start_line: line_index,
+            });
+            current_file = Some(files.len() - 1);
+            pending_old_path = None;
+            lines.push(styled_diff_line(raw_line));
+            continue;
+        }
+        if let Some(path) = raw_line.strip_prefix("--- ") {
+            pending_old_path = Some(trim_diff_path(path));
+            lines.push(styled_diff_line(raw_line));
+            continue;
+        }
+        if let Some(path) = raw_line.strip_prefix("+++ ") {
+            if current_file.is_none() {
+                let old_path = pending_old_path
+                    .take()
+                    .unwrap_or_else(|| "unknown".to_string());
+                files.push(DiffFile {
+                    old_path,
+                    new_path: trim_diff_path(path),
+                    start_line: line_index.saturating_sub(1),
+                });
+                current_file = Some(files.len() - 1);
+            }
+            lines.push(styled_diff_line(raw_line));
+            continue;
+        }
+        if raw_line.starts_with("@@") {
+            let file_index = current_file.unwrap_or_else(|| {
+                files.push(DiffFile {
+                    old_path: "unknown".to_string(),
+                    new_path: "unknown".to_string(),
+                    start_line: line_index,
+                });
+                files.len() - 1
+            });
+            hunks.push(DiffHunk {
+                file_index,
+                start_line: line_index,
+            });
+        }
+        lines.push(styled_diff_line(raw_line));
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from("No diff available."));
+    }
+    (lines, files, hunks)
+}
+
+fn styled_diff_line(line: &str) -> Line<'static> {
+    let style = if line.starts_with("diff --git ") {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if line.starts_with("@@") {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if line.starts_with("+++") || line.starts_with("---") {
+        Style::default().fg(Color::LightBlue)
+    } else if line.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else if line.starts_with("index ")
+        || line.starts_with("new file mode")
+        || line.starts_with("deleted file mode")
+        || line.starts_with("similarity index")
+        || line.starts_with("rename from")
+        || line.starts_with("rename to")
+    {
+        Style::default().fg(TEXT_SECONDARY)
+    } else {
+        Style::default().fg(TEXT_PRIMARY)
+    };
+    Line::from(Span::styled(line.to_string(), style))
+}
+
+fn parse_diff_git_paths(rest: &str) -> (String, String) {
+    let mut parts = rest.split_whitespace();
+    let old_path = parts.next().map(trim_diff_path).unwrap_or_default();
+    let new_path = parts.next().map(trim_diff_path).unwrap_or_default();
+    (old_path, new_path)
+}
+
+fn trim_diff_path(path: &str) -> String {
+    path.trim()
+        .trim_matches('"')
+        .trim_start_matches("a/")
+        .trim_start_matches("b/")
+        .to_string()
+}
+
+fn current_diff_file<'a>(state: &State, files: &'a [DiffFile]) -> Option<&'a DiffFile> {
+    files.get(state.diff_file_index).or_else(|| files.first())
+}
+
+fn display_diff_path(file: &DiffFile) -> String {
+    if file.old_path == file.new_path || file.old_path == "/dev/null" {
+        file.new_path.clone()
+    } else if file.new_path == "/dev/null" {
+        file.old_path.clone()
+    } else {
+        format!("{} -> {}", file.old_path, file.new_path)
+    }
+}
+
 fn open_selected_in_browser(state: &mut State) {
     let Some(url) = selected_github_url(state) else {
         state.status = "No selected item to open".to_string();
@@ -1173,10 +1724,7 @@ fn open_url(url: &str) -> io::Result<()> {
 }
 
 fn relative_age(dt: &DateTime<Utc>) -> String {
-    let secs = Utc::now()
-        .signed_duration_since(*dt)
-        .num_seconds()
-        .max(0);
+    let secs = Utc::now().signed_duration_since(*dt).num_seconds().max(0);
     if secs < 3_600 {
         format!("{}m", secs / 60)
     } else if secs < 86_400 {
@@ -1194,17 +1742,17 @@ fn relative_age(dt: &DateTime<Utc>) -> String {
 
 fn author_color(author: &str) -> Color {
     const PALETTE: [Color; 7] = [
-        Color::Rgb(80, 200, 200),   // teal
-        Color::Rgb(100, 210, 100),  // green
-        Color::Rgb(200, 100, 200),  // magenta
-        Color::Rgb(100, 150, 240),  // blue
-        Color::Rgb(230, 200, 80),   // yellow
-        Color::Rgb(80, 220, 180),   // cyan-green
-        Color::Rgb(210, 130, 210),  // light magenta
+        Color::Rgb(80, 200, 200),  // teal
+        Color::Rgb(100, 210, 100), // green
+        Color::Rgb(200, 100, 200), // magenta
+        Color::Rgb(100, 150, 240), // blue
+        Color::Rgb(230, 200, 80),  // yellow
+        Color::Rgb(80, 220, 180),  // cyan-green
+        Color::Rgb(210, 130, 210), // light magenta
     ];
-    let hash = author
-        .bytes()
-        .fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+    let hash = author.bytes().fold(0usize, |acc, b| {
+        acc.wrapping_mul(31).wrapping_add(b as usize)
+    });
     PALETTE[hash % PALETTE.len()]
 }
 
@@ -1225,7 +1773,16 @@ fn cache_marker(cached: bool) -> Span<'static> {
     }
 }
 
-fn pr_item(pr: &PrData, watch_paths: &[WatchedPathConfig], cached: bool) -> ListItem<'static> {
+fn has_column(columns: &[String], name: &str) -> bool {
+    columns.is_empty() || columns.iter().any(|column| column == name)
+}
+
+fn pr_item(
+    pr: &PrData,
+    watch_paths: &[WatchedPathConfig],
+    cached: bool,
+    columns: &[String],
+) -> ListItem<'static> {
     let (size_label, size_color) = match pr.size_if_known() {
         Some(PrSize::XS) => ("XS".to_string(), Color::Green),
         Some(PrSize::S) => ("S ".to_string(), Color::LightGreen),
@@ -1269,7 +1826,7 @@ fn pr_item(pr: &PrData, watch_paths: &[WatchedPathConfig], cached: bool) -> List
 
     let age = relative_age(&pr.created_at);
 
-    ListItem::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!("#{:>4}", pr.number),
             Style::default()
@@ -1278,22 +1835,32 @@ fn pr_item(pr: &PrData, watch_paths: &[WatchedPathConfig], cached: bool) -> List
         ),
         cache_marker(cached),
         Span::styled("  ", Style::default().fg(TEXT_MUTED)),
-        Span::styled(title_display, Style::default().fg(TEXT_PRIMARY)),
-        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
-        Span::styled(author_display, Style::default().fg(a_color)),
-        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
-        Span::styled(
+    ];
+    if has_column(columns, "title") {
+        spans.push(Span::styled(
+            title_display,
+            Style::default().fg(TEXT_PRIMARY),
+        ));
+        spans.push(Span::styled("  ", Style::default().fg(TEXT_MUTED)));
+    }
+    if has_column(columns, "author") {
+        spans.push(Span::styled(author_display, Style::default().fg(a_color)));
+        spans.push(Span::styled("  ", Style::default().fg(TEXT_MUTED)));
+    }
+    if has_column(columns, "age") {
+        spans.push(Span::styled(
             format!("{:>4}", age),
             Style::default().fg(TEXT_SECONDARY),
-        ),
-        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
-        Span::styled(
+        ));
+        spans.push(Span::styled("  ", Style::default().fg(TEXT_MUTED)));
+    }
+    if has_column(columns, "label") || has_column(columns, "size") {
+        spans.push(Span::styled(
             size_label,
-            Style::default()
-                .fg(size_color)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ]))
+            Style::default().fg(size_color).add_modifier(Modifier::BOLD),
+        ));
+    }
+    ListItem::new(Line::from(spans))
 }
 
 fn watch_badges(files: &[String], watch_paths: &[WatchedPathConfig]) -> String {
@@ -1315,7 +1882,7 @@ fn watch_badges(files: &[String], watch_paths: &[WatchedPathConfig]) -> String {
     badges.join(" ")
 }
 
-fn issue_item(issue: &IssueData, cached: bool) -> ListItem<'static> {
+fn issue_item(issue: &IssueData, cached: bool, columns: &[String]) -> ListItem<'static> {
     let (label_display, label_color) = match issue.label {
         IssueLabel::Bug => ("bug  ", Color::Red),
         IssueLabel::Question => ("quest", Color::Green),
@@ -1331,7 +1898,7 @@ fn issue_item(issue: &IssueData, cached: bool) -> ListItem<'static> {
     let author_display = pad_right(&truncate(&issue.author, 16), 16);
     let title_display = pad_right(&truncate(&issue.title, 52), 52);
     let age = relative_age(&issue.created_at);
-    ListItem::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled(
             format!("#{:>4}", issue.number),
             Style::default()
@@ -1340,22 +1907,184 @@ fn issue_item(issue: &IssueData, cached: bool) -> ListItem<'static> {
         ),
         cache_marker(cached),
         Span::styled("  ", Style::default().fg(TEXT_MUTED)),
-        Span::styled(title_display, Style::default().fg(TEXT_PRIMARY)),
-        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
-        Span::styled(author_display, Style::default().fg(Color::Cyan)),
-        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
-        Span::styled(
+    ];
+    if has_column(columns, "title") {
+        spans.push(Span::styled(
+            title_display,
+            Style::default().fg(TEXT_PRIMARY),
+        ));
+        spans.push(Span::styled("  ", Style::default().fg(TEXT_MUTED)));
+    }
+    if has_column(columns, "author") {
+        spans.push(Span::styled(
+            author_display,
+            Style::default().fg(Color::Cyan),
+        ));
+        spans.push(Span::styled("  ", Style::default().fg(TEXT_MUTED)));
+    }
+    if has_column(columns, "age") {
+        spans.push(Span::styled(
             format!("{:>4}", age),
             Style::default().fg(TEXT_SECONDARY),
-        ),
-        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
-        Span::styled(
+        ));
+        spans.push(Span::styled("  ", Style::default().fg(TEXT_MUTED)));
+    }
+    if has_column(columns, "label") {
+        spans.push(Span::styled(
             label_display,
             Style::default()
                 .fg(label_color)
                 .add_modifier(Modifier::BOLD),
-        ),
-    ]))
+        ));
+    }
+    ListItem::new(Line::from(spans))
+}
+
+fn section_line(title: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        title.to_string(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn body_lines(text: &str) -> Vec<Line<'static>> {
+    if text.trim().is_empty() {
+        return vec![Line::from(Span::styled(
+            "None",
+            Style::default().fg(TEXT_MUTED),
+        ))];
+    }
+    text.lines()
+        .map(|line| {
+            Line::from(Span::styled(
+                line.to_string(),
+                Style::default().fg(TEXT_PRIMARY),
+            ))
+        })
+        .collect()
+}
+
+fn pr_detail_lines(detail: &PrDetail, analysis: &PrAnalysis) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("PR #{}: ", detail.pr.number),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(detail.pr.title.clone(), Style::default().fg(TEXT_PRIMARY)),
+        ]),
+        Line::from(Span::styled(
+            format!(
+                "{} | +{} / -{} | {} files | {:?}",
+                detail.pr.author,
+                detail.pr.additions,
+                detail.pr.deletions,
+                detail.pr.changed_files,
+                detail.pr.size()
+            ),
+            Style::default().fg(TEXT_SECONDARY),
+        )),
+        Line::from(""),
+        section_line("Summary"),
+    ];
+    lines.extend(body_lines(&analysis.summary));
+    lines.push(Line::from(""));
+    lines.push(section_line("Security"));
+    lines.extend(body_lines(&analysis.security_risks));
+    lines.push(Line::from(""));
+    lines.push(section_line("Code Quality"));
+    lines.extend(body_lines(&analysis.code_quality));
+    lines.push(Line::from(""));
+    lines.push(section_line(&format!("Risk: {}", analysis.risk_level)));
+    lines.extend(body_lines(&analysis.disruption_assessment));
+    lines.push(Line::from(""));
+    lines.push(section_line("Backwards Compatibility"));
+    lines.extend(body_lines(&analysis.backwards_compatibility));
+    lines.push(Line::from(""));
+    lines.push(section_line(&format!(
+        "Semver Impact: {}",
+        analysis.semver_impact
+    )));
+    lines.push(Line::from(""));
+    lines.push(section_line("Review Comment"));
+    lines.extend(body_lines(&analysis.review_comment));
+    lines
+}
+
+fn issue_detail_lines(detail: &IssueDetail, analysis: &IssueAnalysis) -> Vec<Line<'static>> {
+    let severity = match analysis.severity {
+        IssueSeverity::Critical => "Critical",
+        IssueSeverity::High => "High",
+        IssueSeverity::Medium => "Medium",
+        IssueSeverity::Low => "Low",
+        IssueSeverity::Info => "Info",
+    };
+    let label = if detail.issue.label_raw.is_empty() {
+        "no label"
+    } else {
+        &detail.issue.label_raw
+    };
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("Issue #{}: ", detail.issue.number),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                detail.issue.title.clone(),
+                Style::default().fg(TEXT_PRIMARY),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!(
+                "{} | {} | {} comments",
+                detail.issue.author, label, detail.issue.comment_count
+            ),
+            Style::default().fg(TEXT_SECONDARY),
+        )),
+        Line::from(""),
+        section_line(&format!("Severity: {severity}")),
+        Line::from(""),
+        section_line("Overview"),
+    ];
+    lines.extend(body_lines(&analysis.overview));
+    lines.push(Line::from(""));
+    lines.push(section_line("Suspected Cause"));
+    lines.extend(body_lines(&analysis.suspected_cause));
+    lines.push(Line::from(""));
+    lines.push(section_line("Suggested Fix"));
+    lines.extend(body_lines(&analysis.suggested_fix));
+    lines
+}
+
+fn pr_detail_text(state: &State) -> String {
+    let Some(detail) = state.pr_detail.as_ref() else {
+        return String::new();
+    };
+    let analysis = state.pr_analysis.clone().unwrap_or_default();
+    pr_detail_lines(detail, &analysis)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn issue_detail_text(state: &State) -> String {
+    let Some(detail) = state.issue_detail.as_ref() else {
+        return String::new();
+    };
+    let analysis = state.issue_analysis.clone().unwrap_or_default();
+    issue_detail_lines(detail, &analysis)
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn render_pr_detail(frame: &mut Frame<'_>, state: &mut State, area: ratatui::layout::Rect) {
@@ -1363,30 +2092,12 @@ fn render_pr_detail(frame: &mut Frame<'_>, state: &mut State, area: ratatui::lay
         frame.render_widget(Paragraph::new("No PR loaded."), area);
         return;
     };
-    let analysis = state.pr_analysis.clone().unwrap_or_default();
-    let text = format!(
-        "PR #{}: {}\n{} | +{} / -{} | {} files | {:?}\n\nSummary\n{}\n\nSecurity\n{}\n\nCode Quality\n{}\n\nRisk: {}\n{}\n\nBackwards Compatibility\n{}\n\nSemver Impact: {}\n\nReview Comment\n{}\n\n[d] Diff  [c] Copy review  [Esc] Back  [q q] Quit",
-        detail.pr.number,
-        detail.pr.title,
-        detail.pr.author,
-        detail.pr.additions,
-        detail.pr.deletions,
-        detail.pr.changed_files,
-        detail.pr.size(),
-        analysis.summary,
-        analysis.security_risks,
-        analysis.code_quality,
-        analysis.risk_level,
-        analysis.disruption_assessment,
-        analysis.backwards_compatibility,
-        analysis.semver_impact,
-        analysis.review_comment,
-    );
-    render_scrollable_text(
+    let lines = pr_detail_lines(detail, &state.pr_analysis.clone().unwrap_or_default());
+    render_scrollable_lines(
         frame,
         area,
         " PR Detail ",
-        text,
+        lines,
         &mut state.pr_detail_scroll,
     );
 }
@@ -1396,62 +2107,95 @@ fn render_issue_detail(frame: &mut Frame<'_>, state: &mut State, area: ratatui::
         frame.render_widget(Paragraph::new("No issue loaded."), area);
         return;
     };
-    let analysis = state.issue_analysis.clone().unwrap_or_default();
-    let severity = match analysis.severity {
-        IssueSeverity::Critical => "Critical",
-        IssueSeverity::High => "High",
-        IssueSeverity::Medium => "Medium",
-        IssueSeverity::Low => "Low",
-        IssueSeverity::Info => "Info",
-    };
-    let text = format!(
-        "Issue #{}: {}\n{} | {} | {} comments\n\nSeverity: {}\n\nOverview\n{}\n\nSuspected Cause\n{}\n\nSuggested Fix\n{}\n\n[c] Copy fix  [Esc] Back  [q q] Quit",
-        detail.issue.number,
-        detail.issue.title,
-        detail.issue.author,
-        if detail.issue.label_raw.is_empty() {
-            "no label"
-        } else {
-            &detail.issue.label_raw
-        },
-        detail.issue.comment_count,
-        severity,
-        analysis.overview,
-        analysis.suspected_cause,
-        analysis.suggested_fix,
-    );
-    render_scrollable_text(
+    let lines = issue_detail_lines(detail, &state.issue_analysis.clone().unwrap_or_default());
+    render_scrollable_lines(
         frame,
         area,
         " Issue Detail ",
-        text,
+        lines,
         &mut state.issue_detail_scroll,
     );
 }
 
 fn render_diff(frame: &mut Frame<'_>, state: &mut State, area: ratatui::layout::Rect) {
-    let diff = state
-        .pr_detail
-        .as_ref()
-        .map(|d| {
-            if d.diff.is_empty() {
-                "No diff available.".to_string()
-            } else {
-                d.diff.clone()
-            }
+    let Some(detail) = state.pr_detail.as_ref() else {
+        render_scrollable_lines(
+            frame,
+            area,
+            " Diff ",
+            vec![Line::from("No PR loaded.")],
+            &mut state.diff_scroll,
+        );
+        return;
+    };
+    if detail.diff.is_empty() {
+        render_scrollable_lines(
+            frame,
+            area,
+            " Diff ",
+            vec![Line::from("No diff available.")],
+            &mut state.diff_scroll,
+        );
+        return;
+    }
+    let (lines, files, hunks) = parse_diff(&detail.diff);
+    sync_diff_position(state, &files, &hunks);
+    let (file_area, diff_area) = if area.width >= 100 && !files.is_empty() {
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(34), Constraint::Min(0)])
+            .split(area);
+        (Some(chunks[0]), chunks[1])
+    } else {
+        (None, area)
+    };
+    if let Some(file_area) = file_area {
+        render_diff_file_panel(frame, file_area, &files, state.diff_file_index);
+    }
+    if let Some(file) = current_diff_file(state, &files) {
+        let file_hunks = hunks
+            .iter()
+            .filter(|hunk| hunk.file_index == state.diff_file_index)
+            .count();
+        let title = format!(
+            " Diff {}/{}  {}  hunks {} ",
+            state.diff_file_index + 1,
+            files.len(),
+            display_diff_path(file),
+            file_hunks
+        );
+        render_scrollable_lines(frame, diff_area, &title, lines, &mut state.diff_scroll);
+    } else {
+        render_scrollable_lines(frame, diff_area, " Diff ", lines, &mut state.diff_scroll);
+    }
+}
+
+fn render_diff_file_panel(frame: &mut Frame<'_>, area: Rect, files: &[DiffFile], selected: usize) {
+    let items = files
+        .iter()
+        .enumerate()
+        .map(|(index, file)| {
+            let marker = if index == selected { "> " } else { "  " };
+            let path = truncate(
+                &display_diff_path(file),
+                area.width.saturating_sub(5) as usize,
+            );
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(path, Style::default().fg(TEXT_PRIMARY)),
+            ]))
         })
-        .unwrap_or_else(|| "No PR loaded.".to_string());
-    render_scrollable_text(
-        frame,
-        area,
-        " Diff - Esc Back ",
-        diff,
-        &mut state.diff_scroll,
-    );
+        .collect::<Vec<_>>();
+    frame.render_widget(List::new(items).block(panel_block(" Files ")), area);
 }
 
 fn render_help(frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
-    let text = "Up/Down   Navigate list items or scroll detail text\nPgUp/PgDn Scroll detail text faster\nLeft/Right Change page\nEnter     Open selected item\no         Open selected item in GitHub\nTab       Switch PRs/issues\nr         Refresh current view or retry failed load\ns         Toggle issue sort\ni         Runtime info\n?         Help\nc         Copy review/fix on detail screens\nd         View PR diff from PR detail\nEsc       Back/close\nq q       Quit";
+    let text = "Up/Down   Navigate list items or scroll detail text\nPgUp/PgDn Scroll detail text faster\nLeft/Right Change page\nEnter     Open selected item\no         Open selected item in GitHub\nTab       Switch PRs/issues\nr         Refresh current view or retry failed load\ns         Toggle issue sort\ni         Runtime info\n?         Help\nc         Copy review/fix on detail screens\nd         View PR diff from PR detail\nn/p       Next/previous diff file\n[/]       Next/previous diff hunk\nEsc       Back/close\nq q       Quit";
     frame.render_widget(
         Paragraph::new(text).block(Block::default().title(" Help ").borders(Borders::ALL)),
         area,

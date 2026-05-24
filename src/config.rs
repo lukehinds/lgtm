@@ -96,11 +96,31 @@ pub struct WatchConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct UiConfig {
+    pub columns: Vec<String>,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            columns: vec![
+                "title".to_string(),
+                "author".to_string(),
+                "age".to_string(),
+                "label".to_string(),
+            ],
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct GitNitConfig {
     pub ai: AiConfig,
     pub github: GitHubConfig,
     pub cache: CacheConfig,
     pub watch: WatchConfig,
+    pub ui: UiConfig,
     #[serde(skip)]
     pub loaded_paths: Vec<PathBuf>,
 }
@@ -112,6 +132,7 @@ impl Default for GitNitConfig {
             github: GitHubConfig::default(),
             cache: CacheConfig::default(),
             watch: WatchConfig::default(),
+            ui: UiConfig::default(),
             loaded_paths: Vec::new(),
         }
     }

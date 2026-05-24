@@ -24,6 +24,10 @@ analysis_ttl_days = 30
 review_input_ttl_days = 14
 max_size_mb = 2048
 
+[ui]
+# Available list columns: title, author, age, label, size
+columns = ["title", "author", "age", "label"]
+
 # Provider examples:
 #
 # Gemini:
