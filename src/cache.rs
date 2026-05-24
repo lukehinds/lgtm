@@ -8,8 +8,8 @@ use sha2::{Digest, Sha256};
 
 use crate::models::{IssueData, PrData};
 
-const DEFAULT_PROVIDER: &str = "claude-code";
-const DEFAULT_MODEL: &str = "sonnet";
+const DEFAULT_PROVIDER: &str = "gemini";
+const DEFAULT_MODEL: &str = "gemini-2.5-pro";
 const DEFAULT_PROMPT_VERSION: &str = "v3";
 const DEFAULT_PR_SCHEMA_VERSION: &str = "pr-analysis-v1";
 const DEFAULT_ISSUE_SCHEMA_VERSION: &str = "issue-analysis-v1";

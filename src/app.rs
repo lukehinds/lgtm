@@ -35,6 +35,8 @@ pub struct AppConfig {
     pub repo: String,
     pub provider: String,
     pub model: String,
+    pub base_url: String,
+    pub api_key_env: String,
     pub prompt_version: String,
     pub cache_ttl_seconds: u64,
     pub poll_interval_seconds: u64,
@@ -198,12 +200,13 @@ impl State {
                 } else {
                     pr.head_sha.clone()
                 };
+                let provider = resolved_provider(&self.config);
                 if let Some(cached) = cache::get_cached_pr_analysis(
                     &self.config.repo,
                     pr.number,
                     &head_sha,
-                    &self.config.provider,
-                    &normalized_model(&self.config.provider, &self.config.model),
+                    &provider.provider,
+                    &provider.model,
                     &self.config.prompt_version,
                     "pr-analysis-v1",
                 ) {
@@ -224,6 +227,8 @@ impl State {
                             &detail,
                             &self.config.provider,
                             &self.config.model,
+                            &self.config.base_url,
+                            &self.config.api_key_env,
                             &self.config.repo,
                             &self.config.prompt_version,
                         )
@@ -241,11 +246,12 @@ impl State {
                     return;
                 };
                 self.status = format!("Loading issue #{}...", issue.number);
+                let provider = resolved_provider(&self.config);
                 if let Some(cached) = cache::get_cached_issue_analysis(
                     &self.config.repo,
                     issue.number,
-                    &self.config.provider,
-                    &normalized_model(&self.config.provider, &self.config.model),
+                    &provider.provider,
+                    &provider.model,
                     &self.config.prompt_version,
                     "issue-analysis-v1",
                 ) {
@@ -266,6 +272,8 @@ impl State {
                             &detail,
                             &self.config.provider,
                             &self.config.model,
+                            &self.config.base_url,
+                            &self.config.api_key_env,
                             &self.config.repo,
                             &self.config.prompt_version,
                         )
@@ -731,11 +739,18 @@ fn render_info(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect
             .collect::<Vec<_>>()
             .join("\n")
     };
+    let provider = resolved_provider(&state.config);
     let text = format!(
-        "Repository: {}\nProvider: {}\nModel: {}\nPrompt Version: {}\nCache TTL: {}s\nPoll Interval: {}s\nConfig:\n{}",
+        "Repository: {}\nProvider: {}\nModel: {}\nBase URL: {}\nAPI Key Env: {}\nPrompt Version: {}\nCache TTL: {}s\nPoll Interval: {}s\nConfig:\n{}",
         state.config.repo,
-        state.config.provider,
-        state.config.model,
+        provider.provider,
+        provider.model,
+        provider.base_url,
+        if provider.api_key_env.is_empty() {
+            "(provider default)"
+        } else {
+            &provider.api_key_env
+        },
         state.config.prompt_version,
         state.config.cache_ttl_seconds,
         state.config.poll_interval_seconds,
@@ -790,10 +805,11 @@ fn truncate(value: &str, max: usize) -> String {
     }
 }
 
-fn normalized_model(provider: &str, model: &str) -> String {
-    if provider == "gemini" && (model.is_empty() || model == "sonnet") {
-        "gemini-2.5-pro".to_string()
-    } else {
-        model.to_string()
-    }
+fn resolved_provider(config: &AppConfig) -> ai::ProviderConfig {
+    ai::resolve_provider_config(
+        &config.provider,
+        &config.model,
+        &config.base_url,
+        &config.api_key_env,
+    )
 }

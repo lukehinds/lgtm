@@ -1,6 +1,6 @@
-use std::env;
+use std::{env, future::Future, pin::Pin};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use regex::Regex;
 use reqwest::Client;
 use serde_json::{Value, json};
@@ -10,8 +10,6 @@ use crate::{
     models::{IssueAnalysis, IssueDetail, IssueSeverity, PrAnalysis, PrDetail},
 };
 
-const DEFAULT_MODEL: &str = "sonnet";
-const DEFAULT_GEMINI_MODEL: &str = "gemini-2.5-pro";
 const PR_SCHEMA_VERSION: &str = "pr-analysis-v1";
 const ISSUE_SCHEMA_VERSION: &str = "issue-analysis-v1";
 
@@ -75,21 +73,193 @@ Respond with a JSON object containing exactly these fields (no markdown, just ra
 }}
 "#;
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderConfig {
+    pub provider: String,
+    pub model: String,
+    pub base_url: String,
+    pub api_key_env: String,
+}
+
+pub trait RestProvider {
+    fn default_model(&self) -> &'static str;
+    fn default_base_url(&self) -> &'static str;
+    fn default_api_key_env(&self) -> &'static str;
+    fn complete<'a>(
+        &'a self,
+        config: &'a ProviderConfig,
+        prompt: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>>;
+}
+
+struct GeminiProvider;
+struct OllamaProvider;
+
+impl RestProvider for GeminiProvider {
+    fn default_model(&self) -> &'static str {
+        "gemini-2.5-pro"
+    }
+
+    fn default_base_url(&self) -> &'static str {
+        "https://generativelanguage.googleapis.com/v1beta"
+    }
+
+    fn default_api_key_env(&self) -> &'static str {
+        "GEMINI_API_KEY"
+    }
+
+    fn complete<'a>(
+        &'a self,
+        config: &'a ProviderConfig,
+        prompt: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let api_key = env::var(&config.api_key_env).with_context(|| {
+                format!("{} environment variable is required", config.api_key_env)
+            })?;
+            let url = format!(
+                "{}/models/{}:generateContent?key={}",
+                config.base_url.trim_end_matches('/'),
+                config.model,
+                api_key
+            );
+            let response: Value = Client::new()
+                .post(url)
+                .json(&json!({ "contents": [{ "parts": [{ "text": prompt }] }] }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            Ok(response
+                .pointer("/candidates/0/content/parts/0/text")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string())
+        })
+    }
+}
+
+impl RestProvider for OllamaProvider {
+    fn default_model(&self) -> &'static str {
+        "llama3.1"
+    }
+
+    fn default_base_url(&self) -> &'static str {
+        "http://localhost:11434"
+    }
+
+    fn default_api_key_env(&self) -> &'static str {
+        ""
+    }
+
+    fn complete<'a>(
+        &'a self,
+        config: &'a ProviderConfig,
+        prompt: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let url = format!("{}/api/generate", config.base_url.trim_end_matches('/'));
+            let response: Value = Client::new()
+                .post(url)
+                .json(&json!({
+                    "model": config.model,
+                    "prompt": prompt,
+                    "stream": false,
+                }))
+                .send()
+                .await?
+                .error_for_status()?
+                .json()
+                .await?;
+            Ok(response
+                .get("response")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string())
+        })
+    }
+}
+
+pub fn resolve_provider_config(
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    api_key_env: &str,
+) -> ProviderConfig {
+    let provider = provider.trim();
+    let model = model.trim();
+    let (provider, model) = match model.split_once('/') {
+        Some((namespace, model_name))
+            if !namespace.trim().is_empty() && !model_name.trim().is_empty() =>
+        {
+            (
+                namespace.trim().to_lowercase(),
+                model_name.trim().to_string(),
+            )
+        }
+        _ => (
+            if provider.is_empty() {
+                "gemini"
+            } else {
+                provider
+            }
+            .to_lowercase(),
+            model.to_string(),
+        ),
+    };
+
+    let provider_impl = provider_by_name(&provider);
+    let default_model = provider_impl
+        .as_ref()
+        .map(|p| p.default_model())
+        .unwrap_or("gpt-4o-mini");
+    let default_base_url = provider_impl
+        .as_ref()
+        .map(|p| p.default_base_url())
+        .unwrap_or("");
+    let default_api_key_env = provider_impl
+        .as_ref()
+        .map(|p| p.default_api_key_env())
+        .unwrap_or("");
+
+    ProviderConfig {
+        provider,
+        model: if model.is_empty() {
+            default_model.to_string()
+        } else {
+            model
+        },
+        base_url: if base_url.trim().is_empty() {
+            default_base_url.to_string()
+        } else {
+            base_url.trim().to_string()
+        },
+        api_key_env: if api_key_env.trim().is_empty() {
+            default_api_key_env.to_string()
+        } else {
+            api_key_env.trim().to_string()
+        },
+    }
+}
+
 pub async fn analyze_pr(
     pr_detail: &PrDetail,
     provider: &str,
     model: &str,
+    base_url: &str,
+    api_key_env: &str,
     repo: &str,
     prompt_version: &str,
 ) -> PrAnalysis {
-    let model = normalize_model(provider, model);
+    let config = resolve_provider_config(provider, model, base_url, api_key_env);
     if !repo.is_empty() && !pr_detail.pr.head_sha.is_empty() {
         if let Some(cached) = cache::get_cached_pr_analysis(
             repo,
             pr_detail.pr.number,
             &pr_detail.pr.head_sha,
-            provider,
-            &model,
+            &config.provider,
+            &config.model,
             prompt_version,
             PR_SCHEMA_VERSION,
         ) {
@@ -97,110 +267,8 @@ pub async fn analyze_pr(
         }
     }
 
-    let analysis = match provider {
-        "gemini" => analyze_pr_with_gemini(pr_detail, &model).await,
-        "claude-code" | "claude" => PrAnalysis {
-            summary: "The Rust port does not implement the Python-only claude-agent-sdk provider.".to_string(),
-            review_comment: "Unable to generate review comment with claude-code in this Rust build. Use --provider gemini with GEMINI_API_KEY.".to_string(),
-            ..PrAnalysis::default()
-        },
-        other => PrAnalysis {
-            summary: format!("AI provider '{other}' is not implemented yet."),
-            review_comment: format!("Unable to generate review comment with provider '{other}'."),
-            ..PrAnalysis::default()
-        },
-    };
-
-    if !repo.is_empty() && !pr_detail.pr.head_sha.is_empty() {
-        cache::save_pr_analysis(
-            repo,
-            pr_detail.pr.number,
-            &pr_detail.pr.head_sha,
-            &serde_json::to_value(&analysis).unwrap_or_else(|_| json!({})),
-            provider,
-            &model,
-            prompt_version,
-            PR_SCHEMA_VERSION,
-        );
-    }
-    analysis
-}
-
-pub async fn analyze_issue(
-    issue_detail: &IssueDetail,
-    provider: &str,
-    model: &str,
-    repo: &str,
-    prompt_version: &str,
-) -> IssueAnalysis {
-    let model = normalize_model(provider, model);
-    if !repo.is_empty() {
-        if let Some(cached) = cache::get_cached_issue_analysis(
-            repo,
-            issue_detail.issue.number,
-            provider,
-            &model,
-            prompt_version,
-            ISSUE_SCHEMA_VERSION,
-        ) {
-            return issue_analysis_from_value(&cached);
-        }
-    }
-
-    let analysis = match provider {
-        "gemini" => analyze_issue_with_gemini(issue_detail, &model).await,
-        "claude-code" | "claude" => IssueAnalysis {
-            overview: "The Rust port does not implement the Python-only claude-agent-sdk provider.".to_string(),
-            suggested_fix: "Use --provider gemini with GEMINI_API_KEY for AI issue analysis in this Rust build.".to_string(),
-            ..IssueAnalysis::default()
-        },
-        other => IssueAnalysis {
-            overview: format!("AI provider '{other}' is not implemented yet."),
-            suggested_fix: format!("Unable to generate fix suggestion with provider '{other}'."),
-            ..IssueAnalysis::default()
-        },
-    };
-
-    if !repo.is_empty() {
-        cache::save_issue_analysis(
-            repo,
-            issue_detail.issue.number,
-            &serde_json::to_value(&analysis).unwrap_or_else(|_| json!({})),
-            provider,
-            &model,
-            prompt_version,
-            ISSUE_SCHEMA_VERSION,
-        );
-    }
-    analysis
-}
-
-async fn analyze_pr_with_gemini(pr_detail: &PrDetail, model: &str) -> PrAnalysis {
-    let diff = if pr_detail.diff.len() > 15_000 {
-        &pr_detail.diff[..15_000]
-    } else {
-        &pr_detail.diff
-    };
-    let prompt = PR_ANALYSIS_PROMPT
-        .replace("{title}", &pr_detail.pr.title)
-        .replace("{author}", &pr_detail.pr.author)
-        .replace("{number}", &pr_detail.pr.number.to_string())
-        .replace("{changed_files}", &pr_detail.pr.changed_files.to_string())
-        .replace("{additions}", &pr_detail.pr.additions.to_string())
-        .replace("{deletions}", &pr_detail.pr.deletions.to_string())
-        .replace("{body}", empty_as(&pr_detail.pr.body, "(no description)"))
-        .replace(
-            "{files}",
-            &pr_detail
-                .files
-                .iter()
-                .map(|f| format!("- {f}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-        )
-        .replace("{diff}", diff);
-
-    match generate_gemini(&prompt, model).await {
+    let prompt = pr_prompt(pr_detail);
+    let analysis = match generate(&config, &prompt).await {
         Ok(text) => extract_json(&text).map_or_else(
             || PrAnalysis {
                 summary: if text.is_empty() {
@@ -218,38 +286,55 @@ async fn analyze_pr_with_gemini(pr_detail: &PrDetail, model: &str) -> PrAnalysis
             |data| pr_analysis_from_value(&data),
         ),
         Err(err) => PrAnalysis {
-            summary: format!("Gemini analysis failed: {err}"),
-            review_comment: "Unable to generate review comment due to a Gemini API error."
-                .to_string(),
+            summary: format!("{} analysis failed: {err}", config.provider),
+            review_comment: format!(
+                "Unable to generate review comment with provider '{}'.",
+                config.provider
+            ),
             ..PrAnalysis::default()
         },
+    };
+
+    if !repo.is_empty() && !pr_detail.pr.head_sha.is_empty() {
+        cache::save_pr_analysis(
+            repo,
+            pr_detail.pr.number,
+            &pr_detail.pr.head_sha,
+            &serde_json::to_value(&analysis).unwrap_or_else(|_| json!({})),
+            &config.provider,
+            &config.model,
+            prompt_version,
+            PR_SCHEMA_VERSION,
+        );
     }
+    analysis
 }
 
-async fn analyze_issue_with_gemini(issue_detail: &IssueDetail, model: &str) -> IssueAnalysis {
-    let comments = if issue_detail.comments.is_empty() {
-        "(no comments)".to_string()
-    } else {
-        issue_detail
-            .comments
-            .iter()
-            .take(10)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n\n")
-    };
-    let prompt = ISSUE_ANALYSIS_PROMPT
-        .replace("{title}", &issue_detail.issue.title)
-        .replace("{author}", &issue_detail.issue.author)
-        .replace("{number}", &issue_detail.issue.number.to_string())
-        .replace("{labels}", empty_as(&issue_detail.issue.label_raw, "none"))
-        .replace(
-            "{body}",
-            empty_as(&issue_detail.issue.body, "(no description)"),
-        )
-        .replace("{comments}", &comments);
+pub async fn analyze_issue(
+    issue_detail: &IssueDetail,
+    provider: &str,
+    model: &str,
+    base_url: &str,
+    api_key_env: &str,
+    repo: &str,
+    prompt_version: &str,
+) -> IssueAnalysis {
+    let config = resolve_provider_config(provider, model, base_url, api_key_env);
+    if !repo.is_empty() {
+        if let Some(cached) = cache::get_cached_issue_analysis(
+            repo,
+            issue_detail.issue.number,
+            &config.provider,
+            &config.model,
+            prompt_version,
+            ISSUE_SCHEMA_VERSION,
+        ) {
+            return issue_analysis_from_value(&cached);
+        }
+    }
 
-    match generate_gemini(&prompt, model).await {
+    let prompt = issue_prompt(issue_detail);
+    let analysis = match generate(&config, &prompt).await {
         Ok(text) => extract_json(&text).map_or_else(
             || IssueAnalysis {
                 overview: if text.is_empty() {
@@ -264,34 +349,92 @@ async fn analyze_issue_with_gemini(issue_detail: &IssueDetail, model: &str) -> I
             |data| issue_analysis_from_value(&data),
         ),
         Err(err) => IssueAnalysis {
-            overview: format!("Gemini analysis failed: {err}"),
-            suggested_fix: "Unable to generate fix suggestion due to a Gemini API error."
-                .to_string(),
+            overview: format!("{} analysis failed: {err}", config.provider),
+            suggested_fix: format!(
+                "Unable to generate fix suggestion with provider '{}'.",
+                config.provider
+            ),
             ..IssueAnalysis::default()
         },
+    };
+
+    if !repo.is_empty() {
+        cache::save_issue_analysis(
+            repo,
+            issue_detail.issue.number,
+            &serde_json::to_value(&analysis).unwrap_or_else(|_| json!({})),
+            &config.provider,
+            &config.model,
+            prompt_version,
+            ISSUE_SCHEMA_VERSION,
+        );
+    }
+    analysis
+}
+
+async fn generate(config: &ProviderConfig, prompt: &str) -> Result<String> {
+    let Some(provider) = provider_by_name(&config.provider) else {
+        bail!("provider '{}' is not implemented", config.provider);
+    };
+    provider.complete(config, prompt).await
+}
+
+fn provider_by_name(provider: &str) -> Option<Box<dyn RestProvider + Send + Sync>> {
+    match provider {
+        "gemini" => Some(Box::new(GeminiProvider)),
+        "ollama" => Some(Box::new(OllamaProvider)),
+        _ => None,
     }
 }
 
-async fn generate_gemini(prompt: &str, model: &str) -> Result<String> {
-    let api_key =
-        env::var("GEMINI_API_KEY").context("GEMINI_API_KEY environment variable is required")?;
-    let url = format!(
-        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
-        model, api_key
-    );
-    let response: Value = Client::new()
-        .post(url)
-        .json(&json!({ "contents": [{ "parts": [{ "text": prompt }] }] }))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
-    Ok(response
-        .pointer("/candidates/0/content/parts/0/text")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string())
+fn pr_prompt(pr_detail: &PrDetail) -> String {
+    let diff = if pr_detail.diff.len() > 15_000 {
+        &pr_detail.diff[..15_000]
+    } else {
+        &pr_detail.diff
+    };
+    PR_ANALYSIS_PROMPT
+        .replace("{title}", &pr_detail.pr.title)
+        .replace("{author}", &pr_detail.pr.author)
+        .replace("{number}", &pr_detail.pr.number.to_string())
+        .replace("{changed_files}", &pr_detail.pr.changed_files.to_string())
+        .replace("{additions}", &pr_detail.pr.additions.to_string())
+        .replace("{deletions}", &pr_detail.pr.deletions.to_string())
+        .replace("{body}", empty_as(&pr_detail.pr.body, "(no description)"))
+        .replace(
+            "{files}",
+            &pr_detail
+                .files
+                .iter()
+                .map(|f| format!("- {f}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .replace("{diff}", diff)
+}
+
+fn issue_prompt(issue_detail: &IssueDetail) -> String {
+    let comments = if issue_detail.comments.is_empty() {
+        "(no comments)".to_string()
+    } else {
+        issue_detail
+            .comments
+            .iter()
+            .take(10)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    };
+    ISSUE_ANALYSIS_PROMPT
+        .replace("{title}", &issue_detail.issue.title)
+        .replace("{author}", &issue_detail.issue.author)
+        .replace("{number}", &issue_detail.issue.number.to_string())
+        .replace("{labels}", empty_as(&issue_detail.issue.label_raw, "none"))
+        .replace(
+            "{body}",
+            empty_as(&issue_detail.issue.body, "(no description)"),
+        )
+        .replace("{comments}", &comments)
 }
 
 pub fn extract_json(text: &str) -> Option<Value> {
@@ -345,14 +488,6 @@ pub fn issue_analysis_from_value(data: &Value) -> IssueAnalysis {
     }
 }
 
-fn normalize_model(provider: &str, model: &str) -> String {
-    if provider == "gemini" && (model.is_empty() || model == DEFAULT_MODEL) {
-        DEFAULT_GEMINI_MODEL.to_string()
-    } else {
-        model.to_string()
-    }
-}
-
 fn empty_as<'a>(value: &'a str, default: &'a str) -> &'a str {
     if value.trim().is_empty() {
         default
@@ -398,5 +533,28 @@ mod tests {
     fn uses_comment_aliases() {
         let analysis = pr_analysis_from_value(&json!({"comment": "ship it"}));
         assert_eq!(analysis.review_comment, "ship it");
+    }
+
+    #[test]
+    fn resolves_explicit_provider_and_model() {
+        let config = resolve_provider_config("gemini", "gemini-2.5-pro", "", "");
+        assert_eq!(config.provider, "gemini");
+        assert_eq!(config.model, "gemini-2.5-pro");
+        assert_eq!(config.api_key_env, "GEMINI_API_KEY");
+    }
+
+    #[test]
+    fn resolves_provider_from_namespaced_model() {
+        let config = resolve_provider_config("", "ollama/llama3.1", "", "");
+        assert_eq!(config.provider, "ollama");
+        assert_eq!(config.model, "llama3.1");
+        assert_eq!(config.base_url, "http://localhost:11434");
+    }
+
+    #[test]
+    fn namespaced_model_overrides_provider() {
+        let config = resolve_provider_config("gemini", "ollama/qwen2.5-coder", "", "");
+        assert_eq!(config.provider, "ollama");
+        assert_eq!(config.model, "qwen2.5-coder");
     }
 }

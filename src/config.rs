@@ -13,14 +13,18 @@ use toml::Value;
 pub struct AiConfig {
     pub provider: String,
     pub model: String,
+    pub base_url: String,
+    pub api_key_env: String,
     pub prompt_version: String,
 }
 
 impl Default for AiConfig {
     fn default() -> Self {
         Self {
-            provider: "claude-code".to_string(),
-            model: "sonnet".to_string(),
+            provider: "gemini".to_string(),
+            model: "gemini-2.5-pro".to_string(),
+            base_url: String::new(),
+            api_key_env: String::new(),
             prompt_version: "v3".to_string(),
         }
     }
