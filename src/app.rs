@@ -1,6 +1,7 @@
 use std::{
     io::{self, Stdout},
     path::PathBuf,
+    process::Command,
     time::Duration,
 };
 
@@ -23,7 +24,10 @@ use ratatui::{
         ScrollbarOrientation, ScrollbarState, Tabs, Wrap,
     },
 };
-use tokio::task::JoinHandle;
+use tokio::{
+    sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
+    task::JoinHandle,
+};
 
 use crate::{
     ai, cache,
@@ -67,6 +71,7 @@ enum Tab {
 enum Screen {
     List,
     Loading,
+    Error,
     Help,
     Info,
     PrDetail,
@@ -108,6 +113,10 @@ struct State {
     issue_detail: Option<IssueDetail>,
     issue_analysis: Option<IssueAnalysis>,
     detail_task: Option<JoinHandle<std::result::Result<DetailLoadResult, String>>>,
+    detail_phase_rx: Option<UnboundedReceiver<String>>,
+    load_error: Option<String>,
+    pr_list_state: ListState,
+    issue_list_state: ListState,
     pr_detail_scroll: u16,
     issue_detail_scroll: u16,
     diff_scroll: u16,
@@ -119,16 +128,16 @@ pub async fn run(config: AppConfig, client: GitHubClient) -> Result<()> {
     let mut state = State::new(config, client);
 
     let result = async {
-        terminal.draw(|frame| render(frame, &state))?;
+        terminal.draw(|frame| render(frame, &mut state))?;
         state.status = "Connecting to GitHub...".to_string();
-        terminal.draw(|frame| render(frame, &state))?;
+        terminal.draw(|frame| render(frame, &mut state))?;
         state.client.ensure_repo_access().await?;
         state.status = "Loading pull requests...".to_string();
-        terminal.draw(|frame| render(frame, &state))?;
+        terminal.draw(|frame| render(frame, &mut state))?;
         state.load_prs(false).await;
-        terminal.draw(|frame| render(frame, &state))?;
+        terminal.draw(|frame| render(frame, &mut state))?;
         state.status = "Loading issues...".to_string();
-        terminal.draw(|frame| render(frame, &state))?;
+        terminal.draw(|frame| render(frame, &mut state))?;
         state.load_issues(false).await;
         state.status = "Ready".to_string();
         run_loop(&mut terminal, &mut state).await
@@ -161,6 +170,10 @@ impl State {
             issue_detail: None,
             issue_analysis: None,
             detail_task: None,
+            detail_phase_rx: None,
+            load_error: None,
+            pr_list_state: ListState::default(),
+            issue_list_state: ListState::default(),
             pr_detail_scroll: 0,
             issue_detail_scroll: 0,
             diff_scroll: 0,
@@ -266,12 +279,15 @@ impl State {
                 self.screen = Screen::Loading;
                 self.pr_detail = None;
                 self.pr_analysis = None;
+                self.load_error = None;
                 self.pr_detail_scroll = 0;
                 self.diff_scroll = 0;
                 let client = self.client.clone();
                 let config = self.config.clone();
+                let (phase_tx, phase_rx) = mpsc::unbounded_channel();
+                self.detail_phase_rx = Some(phase_rx);
                 self.detail_task = Some(tokio::spawn(async move {
-                    load_pr_detail(client, config, pr).await
+                    load_pr_detail(client, config, pr, phase_tx).await
                 }));
             }
             Tab::Issues => {
@@ -282,17 +298,30 @@ impl State {
                 self.screen = Screen::Loading;
                 self.issue_detail = None;
                 self.issue_analysis = None;
+                self.load_error = None;
                 self.issue_detail_scroll = 0;
                 let client = self.client.clone();
                 let config = self.config.clone();
+                let (phase_tx, phase_rx) = mpsc::unbounded_channel();
+                self.detail_phase_rx = Some(phase_rx);
                 self.detail_task = Some(tokio::spawn(async move {
-                    load_issue_detail(client, config, issue).await
+                    load_issue_detail(client, config, issue, phase_tx).await
                 }));
             }
         }
     }
 
+    fn drain_detail_phases(&mut self) {
+        let Some(rx) = self.detail_phase_rx.as_mut() else {
+            return;
+        };
+        while let Ok(status) = rx.try_recv() {
+            self.status = status;
+        }
+    }
+
     async fn complete_detail_load(&mut self) {
+        self.drain_detail_phases();
         let Some(task) = self.detail_task.as_ref() else {
             return;
         };
@@ -302,6 +331,7 @@ impl State {
         let Some(task) = self.detail_task.take() else {
             return;
         };
+        self.detail_phase_rx = None;
         match task.await {
             Ok(Ok(DetailLoadResult::Pr {
                 detail,
@@ -327,12 +357,15 @@ impl State {
                 self.status = status;
             }
             Ok(Err(err)) => {
-                self.screen = Screen::List;
+                self.load_error = Some(err.clone());
+                self.screen = Screen::Error;
                 self.status = err;
             }
             Err(err) => {
-                self.screen = Screen::List;
-                self.status = format!("Detail load failed: {err}");
+                let message = format!("Detail load failed: {err}");
+                self.load_error = Some(message.clone());
+                self.screen = Screen::Error;
+                self.status = message;
             }
         }
     }
@@ -342,13 +375,16 @@ async fn load_pr_detail(
     client: GitHubClient,
     config: AppConfig,
     pr: PrData,
+    phase_tx: UnboundedSender<String>,
 ) -> std::result::Result<DetailLoadResult, String> {
+    let _ = phase_tx.send(format!("Resolving PR #{} revision...", pr.number));
     let head_sha = if pr.head_sha.is_empty() {
         client.get_pr_head_sha(pr.number).await.unwrap_or_default()
     } else {
         pr.head_sha.clone()
     };
     let provider = resolved_provider(&config);
+    let _ = phase_tx.send(format!("Checking cached PR #{} analysis...", pr.number));
     if let Some(cached) = cache::get_cached_pr_analysis(
         &config.cache,
         &config.repo,
@@ -359,6 +395,7 @@ async fn load_pr_detail(
         &config.prompt_version,
         "pr-analysis-v1",
     ) {
+        let _ = phase_tx.send(format!("Loading PR #{} metadata...", pr.number));
         let detail = client
             .get_pr_summary(pr.number, false)
             .await
@@ -369,10 +406,12 @@ async fn load_pr_detail(
             status: "PR analysis loaded from cache".to_string(),
         });
     }
+    let _ = phase_tx.send(format!("Fetching PR #{} diff and metadata...", pr.number));
     let detail = client
         .get_pr_detail(pr.number)
         .await
         .map_err(|err| format!("Failed to load PR: {err}"))?;
+    let _ = phase_tx.send(format!("Analyzing PR #{}...", pr.number));
     let analysis = ai::analyze_pr(
         &detail,
         &config.provider,
@@ -395,8 +434,13 @@ async fn load_issue_detail(
     client: GitHubClient,
     config: AppConfig,
     issue: IssueData,
+    phase_tx: UnboundedSender<String>,
 ) -> std::result::Result<DetailLoadResult, String> {
     let provider = resolved_provider(&config);
+    let _ = phase_tx.send(format!(
+        "Checking cached issue #{} analysis...",
+        issue.number
+    ));
     if let Some(cached) = cache::get_cached_issue_analysis(
         &config.cache,
         &config.repo,
@@ -406,6 +450,7 @@ async fn load_issue_detail(
         &config.prompt_version,
         "issue-analysis-v1",
     ) {
+        let _ = phase_tx.send(format!("Loading issue #{} metadata...", issue.number));
         let detail = client
             .get_issue_summary(issue.number)
             .await
@@ -416,10 +461,12 @@ async fn load_issue_detail(
             status: "Issue analysis loaded from cache".to_string(),
         });
     }
+    let _ = phase_tx.send(format!("Fetching issue #{} details...", issue.number));
     let detail = client
         .get_issue_detail(issue.number)
         .await
         .map_err(|err| format!("Failed to load issue: {err}"))?;
+    let _ = phase_tx.send(format!("Analyzing issue #{}...", issue.number));
     let analysis = ai::analyze_issue(
         &detail,
         &config.provider,
@@ -465,6 +512,7 @@ async fn run_loop(
                 }
                 KeyCode::Char('?') => state.screen = Screen::Help,
                 KeyCode::Char('i') => state.screen = Screen::Info,
+                KeyCode::Char('o') => open_selected_in_browser(state),
                 KeyCode::Tab => {
                     state.tab = if state.tab == Tab::PullRequests {
                         Tab::Issues
@@ -500,11 +548,13 @@ async fn run_loop(
                     Tab::PullRequests if ((state.pr_page + 1) * 15) < state.pr_total as usize => {
                         state.pr_page += 1;
                         state.selected_pr = 0;
+                        *state.pr_list_state.offset_mut() = 0;
                         state.load_prs(false).await;
                     }
                     Tab::Issues if ((state.issue_page + 1) * 15) < state.issue_total as usize => {
                         state.issue_page += 1;
                         state.selected_issue = 0;
+                        *state.issue_list_state.offset_mut() = 0;
                         state.load_issues(false).await;
                     }
                     _ => {}
@@ -513,11 +563,13 @@ async fn run_loop(
                     Tab::PullRequests if state.pr_page > 0 => {
                         state.pr_page -= 1;
                         state.selected_pr = 0;
+                        *state.pr_list_state.offset_mut() = 0;
                         state.load_prs(false).await;
                     }
                     Tab::Issues if state.issue_page > 0 => {
                         state.issue_page -= 1;
                         state.selected_issue = 0;
+                        *state.issue_list_state.offset_mut() = 0;
                         state.load_issues(false).await;
                     }
                     _ => {}
@@ -530,9 +582,22 @@ async fn run_loop(
                     if let Some(task) = state.detail_task.take() {
                         task.abort();
                     }
+                    state.detail_phase_rx = None;
                     state.screen = Screen::List;
                     state.status = "Load cancelled".to_string();
                 }
+                KeyCode::Char('q') => {
+                    if state.quit_armed {
+                        break;
+                    }
+                    state.quit_armed = true;
+                    state.status = "Press q again to quit".to_string();
+                }
+                _ => state.quit_armed = false,
+            },
+            Screen::Error => match key.code {
+                KeyCode::Esc => state.screen = Screen::List,
+                KeyCode::Char('r') => state.open_selected(),
                 KeyCode::Char('q') => {
                     if state.quit_armed {
                         break;
@@ -551,6 +616,7 @@ async fn run_loop(
             Screen::PrDetail => match key.code {
                 KeyCode::Esc => state.screen = Screen::List,
                 KeyCode::Char('d') => state.screen = Screen::Diff,
+                KeyCode::Char('o') => open_selected_in_browser(state),
                 KeyCode::Down => scroll_down(&mut state.pr_detail_scroll, 1),
                 KeyCode::Up => scroll_up(&mut state.pr_detail_scroll, 1),
                 KeyCode::PageDown => scroll_down(&mut state.pr_detail_scroll, 10),
@@ -575,6 +641,7 @@ async fn run_loop(
             },
             Screen::IssueDetail => match key.code {
                 KeyCode::Esc => state.screen = Screen::List,
+                KeyCode::Char('o') => open_selected_in_browser(state),
                 KeyCode::Down => scroll_down(&mut state.issue_detail_scroll, 1),
                 KeyCode::Up => scroll_up(&mut state.issue_detail_scroll, 1),
                 KeyCode::PageDown => scroll_down(&mut state.issue_detail_scroll, 10),
@@ -618,7 +685,7 @@ async fn run_loop(
     Ok(())
 }
 
-fn render(frame: &mut Frame<'_>, state: &State) {
+fn render(frame: &mut Frame<'_>, state: &mut State) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -658,6 +725,7 @@ fn render(frame: &mut Frame<'_>, state: &State) {
     match state.screen {
         Screen::List => render_list(frame, state, chunks[2]),
         Screen::Loading => render_loading(frame, state, chunks[2]),
+        Screen::Error => render_error(frame, state, chunks[2]),
         Screen::Help => render_help(frame, chunks[2]),
         Screen::Info => render_info(frame, state, chunks[2]),
         Screen::PrDetail => render_pr_detail(frame, state, chunks[2]),
@@ -722,6 +790,7 @@ fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
             ("Tab", "switch"),
             ("r", "refresh"),
             ("s", "sort"),
+            ("o", "github"),
             ("i", "info"),
             ("?", "help"),
             ("q q", "quit"),
@@ -731,6 +800,7 @@ fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
             ("Tab", "switch"),
             ("r", "refresh"),
             ("s", "newest/oldest"),
+            ("o", "github"),
             ("?", "help"),
             ("q q", "quit"),
         ]),
@@ -738,17 +808,20 @@ fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
             ("Up/Down", "scroll"),
             ("d", "diff"),
             ("c", "copy review"),
+            ("o", "github"),
             ("Esc", "back"),
             ("q q", "quit"),
         ]),
         Screen::IssueDetail => hint_spans(&[
             ("Up/Down", "scroll"),
             ("c", "copy fix"),
+            ("o", "github"),
             ("Esc", "back"),
             ("q q", "quit"),
         ]),
         Screen::Diff => hint_spans(&[("Up/Down", "scroll"), ("Esc", "back"), ("q q", "quit")]),
         Screen::Loading => hint_spans(&[("Esc", "cancel"), ("q q", "quit")]),
+        Screen::Error => hint_spans(&[("r", "retry"), ("Esc", "back"), ("q q", "quit")]),
         Screen::Help | Screen::Info => hint_spans(&[("Esc", "close")]),
     };
     let status = if is_busy_status(&state.status) {
@@ -767,16 +840,24 @@ fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
     );
 }
 
-fn render_list(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect) {
+fn render_list(frame: &mut Frame<'_>, state: &mut State, area: ratatui::layout::Rect) {
     match state.tab {
         Tab::PullRequests => {
+            let provider = resolved_provider(&state.config);
             let items = state
                 .prs
                 .iter()
-                .map(|pr| pr_item(pr, &state.config.watch_paths))
+                .map(|pr| {
+                    pr_item(
+                        pr,
+                        &state.config.watch_paths,
+                        pr_has_cached_analysis(state, pr, &provider),
+                    )
+                })
                 .collect::<Vec<_>>();
-            let mut list_state = ListState::default();
-            list_state.select((!items.is_empty()).then_some(state.selected_pr));
+            state
+                .pr_list_state
+                .select((!items.is_empty()).then_some(state.selected_pr));
             let total_pages = pages(state.pr_total);
             let title = format!(
                 " Pull Requests  page {} / {}  total {} ",
@@ -804,14 +885,20 @@ fn render_list(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect
                         )
                         .highlight_symbol(" > "),
                     area,
-                    &mut list_state,
+                    &mut state.pr_list_state,
                 );
             }
         }
         Tab::Issues => {
-            let items = state.issues.iter().map(issue_item).collect::<Vec<_>>();
-            let mut list_state = ListState::default();
-            list_state.select((!items.is_empty()).then_some(state.selected_issue));
+            let provider = resolved_provider(&state.config);
+            let items = state
+                .issues
+                .iter()
+                .map(|issue| issue_item(issue, issue_has_cached_analysis(state, issue, &provider)))
+                .collect::<Vec<_>>();
+            state
+                .issue_list_state
+                .select((!items.is_empty()).then_some(state.selected_issue));
             let order = if state.issue_newest {
                 "Newest first"
             } else {
@@ -843,11 +930,43 @@ fn render_list(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect
                         )
                         .highlight_symbol(" > "),
                     area,
-                    &mut list_state,
+                    &mut state.issue_list_state,
                 );
             }
         }
     }
+}
+
+fn pr_has_cached_analysis(state: &State, pr: &PrData, provider: &ai::ProviderConfig) -> bool {
+    !pr.head_sha.is_empty()
+        && cache::get_cached_pr_analysis(
+            &state.config.cache,
+            &state.config.repo,
+            pr.number,
+            &pr.head_sha,
+            &provider.provider,
+            &provider.model,
+            &state.config.prompt_version,
+            "pr-analysis-v1",
+        )
+        .is_some()
+}
+
+fn issue_has_cached_analysis(
+    state: &State,
+    issue: &IssueData,
+    provider: &ai::ProviderConfig,
+) -> bool {
+    cache::get_cached_issue_analysis(
+        &state.config.cache,
+        &state.config.repo,
+        issue.number,
+        &provider.provider,
+        &provider.model,
+        &state.config.prompt_version,
+        "issue-analysis-v1",
+    )
+    .is_some()
 }
 
 fn panel_block(title: &str) -> Block<'_> {
@@ -914,25 +1033,57 @@ fn render_loading(frame: &mut Frame<'_>, state: &State, area: Rect) {
     );
 }
 
+fn render_error(frame: &mut Frame<'_>, state: &State, area: Rect) {
+    let message = state
+        .load_error
+        .as_deref()
+        .unwrap_or("The selected item could not be loaded.");
+    let text = Text::from(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            "Could not load selected item",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            message.to_string(),
+            Style::default().fg(TEXT_PRIMARY),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press r to retry or Esc to return to the list.",
+            Style::default().fg(TEXT_SECONDARY),
+        )),
+    ]);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(panel_block(" Error "))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
+}
+
 fn render_scrollable_text(
     frame: &mut Frame<'_>,
     area: Rect,
     title: &str,
     text: String,
-    scroll: u16,
+    scroll: &mut u16,
 ) {
     let line_count = text.lines().count();
     let viewport = area.height.saturating_sub(2) as usize;
+    let max_scroll = line_count.saturating_sub(viewport);
+    *scroll = (*scroll).min(max_scroll.min(u16::MAX as usize) as u16);
     frame.render_widget(
         Paragraph::new(text)
             .block(Block::default().title(title).borders(Borders::ALL))
             .wrap(Wrap { trim: false })
-            .scroll((scroll, 0)),
+            .scroll((*scroll, 0)),
         area,
     );
     if line_count > viewport && area.height > 2 {
-        let mut state =
-            ScrollbarState::new(line_count.saturating_sub(viewport)).position(scroll as usize);
+        let mut state = ScrollbarState::new(max_scroll).position(*scroll as usize);
         frame.render_stateful_widget(
             Scrollbar::new(ScrollbarOrientation::VerticalRight),
             area.inner(Margin {
@@ -977,6 +1128,50 @@ fn scroll_up(scroll: &mut u16, amount: u16) {
     *scroll = scroll.saturating_sub(amount);
 }
 
+fn open_selected_in_browser(state: &mut State) {
+    let Some(url) = selected_github_url(state) else {
+        state.status = "No selected item to open".to_string();
+        return;
+    };
+    match open_url(&url) {
+        Ok(()) => state.status = format!("Opened {url}"),
+        Err(err) => state.status = format!("Failed to open browser: {err}"),
+    }
+}
+
+fn selected_github_url(state: &State) -> Option<String> {
+    let repo = state.config.repo.trim();
+    if repo.is_empty() {
+        return None;
+    }
+    match state.tab {
+        Tab::PullRequests => {
+            let pr = state.prs.get(state.selected_pr)?;
+            Some(format!("https://github.com/{repo}/pull/{}", pr.number))
+        }
+        Tab::Issues => {
+            let issue = state.issues.get(state.selected_issue)?;
+            Some(format!("https://github.com/{repo}/issues/{}", issue.number))
+        }
+    }
+}
+
+fn open_url(url: &str) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open").arg(url).spawn()?;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Command::new("cmd").args(["/C", "start", "", url]).spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        Command::new("xdg-open").arg(url).spawn()?;
+    }
+    Ok(())
+}
+
 fn relative_age(dt: &DateTime<Utc>) -> String {
     let secs = Utc::now()
         .signed_duration_since(*dt)
@@ -1017,7 +1212,20 @@ fn pad_right(s: &str, width: usize) -> String {
     format!("{:<width$}", s, width = width)
 }
 
-fn pr_item(pr: &PrData, watch_paths: &[WatchedPathConfig]) -> ListItem<'static> {
+fn cache_marker(cached: bool) -> Span<'static> {
+    if cached {
+        Span::styled(
+            " C",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("  ", Style::default().fg(TEXT_MUTED))
+    }
+}
+
+fn pr_item(pr: &PrData, watch_paths: &[WatchedPathConfig], cached: bool) -> ListItem<'static> {
     let (size_label, size_color) = match pr.size_if_known() {
         Some(PrSize::XS) => ("XS".to_string(), Color::Green),
         Some(PrSize::S) => ("S ".to_string(), Color::LightGreen),
@@ -1057,7 +1265,7 @@ fn pr_item(pr: &PrData, watch_paths: &[WatchedPathConfig]) -> ListItem<'static> 
     } else {
         format!("{badges} {}", pr.title)
     };
-    let title_display = pad_right(&truncate(&title_raw, 54), 54);
+    let title_display = pad_right(&truncate(&title_raw, 52), 52);
 
     let age = relative_age(&pr.created_at);
 
@@ -1068,6 +1276,7 @@ fn pr_item(pr: &PrData, watch_paths: &[WatchedPathConfig]) -> ListItem<'static> 
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
+        cache_marker(cached),
         Span::styled("  ", Style::default().fg(TEXT_MUTED)),
         Span::styled(title_display, Style::default().fg(TEXT_PRIMARY)),
         Span::styled("  ", Style::default().fg(TEXT_MUTED)),
@@ -1106,7 +1315,7 @@ fn watch_badges(files: &[String], watch_paths: &[WatchedPathConfig]) -> String {
     badges.join(" ")
 }
 
-fn issue_item(issue: &IssueData) -> ListItem<'static> {
+fn issue_item(issue: &IssueData, cached: bool) -> ListItem<'static> {
     let (label_display, label_color) = match issue.label {
         IssueLabel::Bug => ("bug  ", Color::Red),
         IssueLabel::Question => ("quest", Color::Green),
@@ -1120,7 +1329,7 @@ fn issue_item(issue: &IssueData) -> ListItem<'static> {
         }
     };
     let author_display = pad_right(&truncate(&issue.author, 16), 16);
-    let title_display = pad_right(&truncate(&issue.title, 54), 54);
+    let title_display = pad_right(&truncate(&issue.title, 52), 52);
     let age = relative_age(&issue.created_at);
     ListItem::new(Line::from(vec![
         Span::styled(
@@ -1129,6 +1338,7 @@ fn issue_item(issue: &IssueData) -> ListItem<'static> {
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
         ),
+        cache_marker(cached),
         Span::styled("  ", Style::default().fg(TEXT_MUTED)),
         Span::styled(title_display, Style::default().fg(TEXT_PRIMARY)),
         Span::styled("  ", Style::default().fg(TEXT_MUTED)),
@@ -1148,7 +1358,7 @@ fn issue_item(issue: &IssueData) -> ListItem<'static> {
     ]))
 }
 
-fn render_pr_detail(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect) {
+fn render_pr_detail(frame: &mut Frame<'_>, state: &mut State, area: ratatui::layout::Rect) {
     let Some(detail) = &state.pr_detail else {
         frame.render_widget(Paragraph::new("No PR loaded."), area);
         return;
@@ -1172,10 +1382,16 @@ fn render_pr_detail(frame: &mut Frame<'_>, state: &State, area: ratatui::layout:
         analysis.semver_impact,
         analysis.review_comment,
     );
-    render_scrollable_text(frame, area, " PR Detail ", text, state.pr_detail_scroll);
+    render_scrollable_text(
+        frame,
+        area,
+        " PR Detail ",
+        text,
+        &mut state.pr_detail_scroll,
+    );
 }
 
-fn render_issue_detail(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect) {
+fn render_issue_detail(frame: &mut Frame<'_>, state: &mut State, area: ratatui::layout::Rect) {
     let Some(detail) = &state.issue_detail else {
         frame.render_widget(Paragraph::new("No issue loaded."), area);
         return;
@@ -1209,11 +1425,11 @@ fn render_issue_detail(frame: &mut Frame<'_>, state: &State, area: ratatui::layo
         area,
         " Issue Detail ",
         text,
-        state.issue_detail_scroll,
+        &mut state.issue_detail_scroll,
     );
 }
 
-fn render_diff(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect) {
+fn render_diff(frame: &mut Frame<'_>, state: &mut State, area: ratatui::layout::Rect) {
     let diff = state
         .pr_detail
         .as_ref()
@@ -1225,11 +1441,17 @@ fn render_diff(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect
             }
         })
         .unwrap_or_else(|| "No PR loaded.".to_string());
-    render_scrollable_text(frame, area, " Diff - Esc Back ", diff, state.diff_scroll);
+    render_scrollable_text(
+        frame,
+        area,
+        " Diff - Esc Back ",
+        diff,
+        &mut state.diff_scroll,
+    );
 }
 
 fn render_help(frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
-    let text = "Up/Down   Navigate list items or scroll detail text\nPgUp/PgDn Scroll detail text faster\nLeft/Right Change page\nEnter     Open selected item\nTab       Switch PRs/issues\nr         Refresh current view\ns         Toggle issue sort\ni         Runtime info\n?         Help\nc         Copy review/fix on detail screens\nd         View PR diff from PR detail\nEsc       Back/close\nq q       Quit";
+    let text = "Up/Down   Navigate list items or scroll detail text\nPgUp/PgDn Scroll detail text faster\nLeft/Right Change page\nEnter     Open selected item\no         Open selected item in GitHub\nTab       Switch PRs/issues\nr         Refresh current view or retry failed load\ns         Toggle issue sort\ni         Runtime info\n?         Help\nc         Copy review/fix on detail screens\nd         View PR diff from PR detail\nEsc       Back/close\nq q       Quit";
     frame.render_widget(
         Paragraph::new(text).block(Block::default().title(" Help ").borders(Borders::ALL)),
         area,
