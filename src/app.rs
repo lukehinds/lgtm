@@ -4,6 +4,8 @@ use std::{
     time::Duration,
 };
 
+use chrono::{DateTime, Utc};
+
 use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
@@ -29,6 +31,12 @@ use crate::{
     },
     sorting,
 };
+
+// RGB text tiers — bypasses terminal ANSI palette remapping so these render
+// consistently across Warp, iTerm2, kitty, etc. regardless of color scheme.
+const TEXT_PRIMARY: Color = Color::Rgb(210, 210, 210); // body text, titles
+const TEXT_SECONDARY: Color = Color::Rgb(150, 150, 150); // age, model name, dim info
+const TEXT_MUTED: Color = Color::Rgb(100, 100, 100); // separators, borders
 
 #[derive(Debug, Clone)]
 pub struct AppConfig {
@@ -479,7 +487,7 @@ fn render(frame: &mut Frame<'_>, state: &State) {
         .map(|title| {
             Line::from(Span::styled(
                 title,
-                Style::default().add_modifier(Modifier::BOLD),
+                Style::default().fg(TEXT_SECONDARY).add_modifier(Modifier::BOLD),
             ))
         })
         .collect::<Vec<_>>();
@@ -527,7 +535,7 @@ fn render_header(frame: &mut Frame<'_>, state: &State, area: Rect) {
         ),
         Span::styled(
             format!("  {} / {}", provider.provider, provider.model),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(TEXT_SECONDARY),
         ),
     ]);
     frame.render_widget(
@@ -538,28 +546,60 @@ fn render_header(frame: &mut Frame<'_>, state: &State, area: Rect) {
     );
 }
 
-fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
-    let help = match state.screen {
-        Screen::List => {
-            "Enter open  Tab switch  r refresh  s sort issues  i info  ? help  q q quit"
+fn hint_spans(pairs: &[(&'static str, &'static str)]) -> Vec<Span<'static>> {
+    let key_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(TEXT_SECONDARY);
+    let sep_style = Style::default().fg(TEXT_MUTED);
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for (i, (key, desc)) in pairs.iter().enumerate() {
+        if i > 0 {
+            out.push(Span::styled("  ", sep_style));
         }
-        Screen::PrDetail => "d diff  c copy review  Esc back  q q quit",
-        Screen::IssueDetail => "c copy fix  Esc back  q q quit",
-        Screen::Diff => "Esc back  q q quit",
-        Screen::Help | Screen::Info => "Esc close",
+        out.push(Span::styled(*key, key_style));
+        out.push(Span::styled(format!(" {desc}"), desc_style));
+    }
+    out
+}
+
+fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
+    let help_spans: Vec<Span<'static>> = match state.screen {
+        Screen::List => hint_spans(&[
+            ("Enter", "open"),
+            ("Tab", "switch"),
+            ("r", "refresh"),
+            ("s", "sort"),
+            ("i", "info"),
+            ("?", "help"),
+            ("q q", "quit"),
+        ]),
+        Screen::PrDetail => hint_spans(&[
+            ("d", "diff"),
+            ("c", "copy review"),
+            ("Esc", "back"),
+            ("q q", "quit"),
+        ]),
+        Screen::IssueDetail => hint_spans(&[
+            ("c", "copy fix"),
+            ("Esc", "back"),
+            ("q q", "quit"),
+        ]),
+        Screen::Diff => hint_spans(&[("Esc", "back"), ("q q", "quit")]),
+        Screen::Help | Screen::Info => hint_spans(&[("Esc", "close")]),
     };
     let status = if is_busy_status(&state.status) {
         format!("{} {}", spinner(), state.status)
     } else {
         state.status.clone()
     };
-    let line = Line::from(vec![
+    let mut spans = vec![
         Span::styled(status, Style::default().fg(status_color(&state.status))),
-        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
-        Span::styled(help, Style::default().fg(Color::DarkGray)),
-    ]);
+        Span::styled(" │ ", Style::default().fg(TEXT_MUTED)),
+    ];
+    spans.extend(help_spans);
     frame.render_widget(
-        Paragraph::new(line).block(Block::default().borders(Borders::TOP)),
+        Paragraph::new(Line::from(spans)).block(Block::default().borders(Borders::TOP)),
         area,
     );
 }
@@ -655,7 +695,7 @@ fn panel_block(title: &str) -> Block<'_> {
         .border_style(Style::default().fg(Color::DarkGray))
         .title_style(
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Color::Rgb(80, 200, 200))
                 .add_modifier(Modifier::BOLD),
         )
 }
@@ -705,46 +745,120 @@ fn is_busy_status(status: &str) -> bool {
 }
 
 fn spinner() -> &'static str {
-    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     let tick = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| (duration.as_millis() / 180) as usize)
+        .map(|d| (d.as_millis() / 100) as usize)
         .unwrap_or(0);
     FRAMES[tick % FRAMES.len()]
 }
 
+fn relative_age(dt: &DateTime<Utc>) -> String {
+    let secs = Utc::now()
+        .signed_duration_since(*dt)
+        .num_seconds()
+        .max(0);
+    if secs < 3_600 {
+        format!("{}m", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h", secs / 3_600)
+    } else if secs < 86_400 * 7 {
+        format!("{}d", secs / 86_400)
+    } else if secs < 86_400 * 30 {
+        format!("{}w", secs / (86_400 * 7))
+    } else if secs < 86_400 * 365 {
+        format!("{}mo", secs / (86_400 * 30))
+    } else {
+        format!("{}y", secs / (86_400 * 365))
+    }
+}
+
+fn author_color(author: &str) -> Color {
+    const PALETTE: [Color; 7] = [
+        Color::Rgb(80, 200, 200),   // teal
+        Color::Rgb(100, 210, 100),  // green
+        Color::Rgb(200, 100, 200),  // magenta
+        Color::Rgb(100, 150, 240),  // blue
+        Color::Rgb(230, 200, 80),   // yellow
+        Color::Rgb(80, 220, 180),   // cyan-green
+        Color::Rgb(210, 130, 210),  // light magenta
+    ];
+    let hash = author
+        .bytes()
+        .fold(0usize, |acc, b| acc.wrapping_mul(31).wrapping_add(b as usize));
+    PALETTE[hash % PALETTE.len()]
+}
+
+fn pad_right(s: &str, width: usize) -> String {
+    format!("{:<width$}", s, width = width)
+}
+
 fn pr_item(pr: &PrData, watch_paths: &[WatchedPathConfig]) -> ListItem<'static> {
     let (size_label, size_color) = match pr.size_if_known() {
-        Some(PrSize::XS) | Some(PrSize::S) => (format!("{:?}", pr.size()), Color::Green),
-        Some(PrSize::M) => (format!("{:?}", pr.size()), Color::Yellow),
-        Some(PrSize::L) | Some(PrSize::XL) => (format!("{:?}", pr.size()), Color::Red),
-        None => ("--".to_string(), Color::DarkGray),
+        Some(PrSize::XS) => ("XS".to_string(), Color::Green),
+        Some(PrSize::S) => ("S ".to_string(), Color::LightGreen),
+        Some(PrSize::M) => ("M ".to_string(), Color::Yellow),
+        Some(PrSize::L) => ("L ".to_string(), Color::LightRed),
+        Some(PrSize::XL) => ("XL".to_string(), Color::Red),
+        None => {
+            // Fall back to first label when line counts aren't available from
+            // the list endpoint. Slice to 6 chars without adding "..." suffix.
+            let lbl = pr
+                .labels
+                .first()
+                .map(|l| {
+                    let end = l.char_indices().nth(6).map(|(i, _)| i).unwrap_or(l.len());
+                    l[..end].to_string()
+                })
+                .unwrap_or_else(|| "·".to_string());
+            (format!("{:<6}", lbl), Color::DarkGray)
+        }
     };
-    let author = if pr.is_dependabot {
+
+    let author_raw = if pr.is_dependabot {
         "BOT".to_string()
     } else {
         pr.author.clone()
     };
-    let badges = watch_badges(&pr.files, watch_paths);
-    let title = if badges.is_empty() {
-        truncate(&pr.title, 62)
+    let a_color = if pr.is_dependabot {
+        Color::DarkGray
     } else {
-        truncate(&format!("{badges} {}", pr.title), 62)
+        author_color(&author_raw)
     };
+    let author_display = pad_right(&truncate(&author_raw, 16), 16);
+
+    let badges = watch_badges(&pr.files, watch_paths);
+    let title_raw = if badges.is_empty() {
+        pr.title.clone()
+    } else {
+        format!("{badges} {}", pr.title)
+    };
+    let title_display = pad_right(&truncate(&title_raw, 54), 54);
+
+    let age = relative_age(&pr.created_at);
+
     ListItem::new(Line::from(vec![
         Span::styled(
-            format!("#{} ", pr.number),
-            Style::default().fg(Color::DarkGray),
+            format!("#{:>4}", pr.number),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(title),
-        Span::styled(format!("  {author}  "), Style::default().fg(Color::Cyan)),
+        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
+        Span::styled(title_display, Style::default().fg(TEXT_PRIMARY)),
+        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
+        Span::styled(author_display, Style::default().fg(a_color)),
+        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
         Span::styled(
-            pr.created_at.format("%d/%b").to_string(),
-            Style::default().fg(Color::DarkGray),
+            format!("{:>4}", age),
+            Style::default().fg(TEXT_SECONDARY),
         ),
+        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
         Span::styled(
-            format!("  {size_label}"),
-            Style::default().fg(size_color).add_modifier(Modifier::BOLD),
+            size_label,
+            Style::default()
+                .fg(size_color)
+                .add_modifier(Modifier::BOLD),
         ),
     ]))
 }
@@ -769,30 +883,43 @@ fn watch_badges(files: &[String], watch_paths: &[WatchedPathConfig]) -> String {
 }
 
 fn issue_item(issue: &IssueData) -> ListItem<'static> {
-    let color = match issue.label {
-        IssueLabel::Bug => Color::Red,
-        IssueLabel::Question => Color::Green,
-        IssueLabel::Enhancement => Color::Blue,
-        IssueLabel::Feature => Color::Magenta,
-        IssueLabel::Other => Color::DarkGray,
+    let (label_display, label_color) = match issue.label {
+        IssueLabel::Bug => ("bug  ", Color::Red),
+        IssueLabel::Question => ("quest", Color::Green),
+        IssueLabel::Enhancement => ("enhnc", Color::LightCyan),
+        IssueLabel::Feature => ("feat ", Color::Magenta),
+        IssueLabel::Other => {
+            let short = truncate(&issue.label_raw, 5);
+            // label_raw is always known at list time; use a static fallback
+            let _ = short;
+            ("other", Color::DarkGray)
+        }
     };
+    let author_display = pad_right(&truncate(&issue.author, 16), 16);
+    let title_display = pad_right(&truncate(&issue.title, 54), 54);
+    let age = relative_age(&issue.created_at);
     ListItem::new(Line::from(vec![
         Span::styled(
-            format!("#{} ", issue.number),
-            Style::default().fg(Color::DarkGray),
+            format!("#{:>4}", issue.number),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
-        Span::raw(truncate(&issue.title, 62)),
+        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
+        Span::styled(title_display, Style::default().fg(TEXT_PRIMARY)),
+        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
+        Span::styled(author_display, Style::default().fg(Color::Cyan)),
+        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
         Span::styled(
-            format!("  {}  ", issue.author),
-            Style::default().fg(Color::Cyan),
+            format!("{:>4}", age),
+            Style::default().fg(TEXT_SECONDARY),
         ),
+        Span::styled("  ", Style::default().fg(TEXT_MUTED)),
         Span::styled(
-            issue.created_at.format("%d/%b").to_string(),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(
-            format!("  || {}", issue.label_raw),
-            Style::default().fg(color),
+            label_display,
+            Style::default()
+                .fg(label_color)
+                .add_modifier(Modifier::BOLD),
         ),
     ]))
 }
