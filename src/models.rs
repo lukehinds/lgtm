@@ -106,8 +106,16 @@ impl PrData {
         self.additions + self.deletions
     }
 
+    pub fn change_stats_known(&self) -> bool {
+        self.additions > 0 || self.deletions > 0 || self.changed_files > 0
+    }
+
     pub fn size(&self) -> PrSize {
         PrSize::from_lines(self.lines_changed())
+    }
+
+    pub fn size_if_known(&self) -> Option<PrSize> {
+        self.change_stats_known().then(|| self.size())
     }
 }
 
@@ -167,5 +175,43 @@ impl Default for IssueAnalysis {
             suspected_cause: String::new(),
             suggested_fix: String::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_pr(additions: i64, deletions: i64, changed_files: i64) -> PrData {
+        PrData {
+            number: 1,
+            title: "test".to_string(),
+            author: "author".to_string(),
+            is_dependabot: false,
+            additions,
+            deletions,
+            changed_files,
+            ci_status: CiStatus::Unknown,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            head_sha: "sha".to_string(),
+            body: String::new(),
+            labels: Vec::new(),
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn zero_change_stats_are_unknown_for_list_prs() {
+        let pr = sample_pr(0, 0, 0);
+        assert!(!pr.change_stats_known());
+        assert_eq!(pr.size_if_known(), None);
+    }
+
+    #[test]
+    fn detail_change_stats_get_size() {
+        let pr = sample_pr(208_146, 5_962, 816);
+        assert!(pr.change_stats_known());
+        assert_eq!(pr.size_if_known(), Some(PrSize::XL));
     }
 }

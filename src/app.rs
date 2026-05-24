@@ -13,15 +13,15 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 
 use crate::{
     ai, cache,
-    config::WatchedPathConfig,
+    config::{CacheConfig, WatchedPathConfig},
     github::GitHubClient,
     models::{
         IssueAnalysis, IssueData, IssueDetail, IssueLabel, IssueSeverity, PrAnalysis, PrData,
@@ -38,6 +38,7 @@ pub struct AppConfig {
     pub base_url: String,
     pub api_key_env: String,
     pub prompt_version: String,
+    pub cache: CacheConfig,
     pub cache_ttl_seconds: u64,
     pub poll_interval_seconds: u64,
     pub config_paths: Vec<PathBuf>,
@@ -83,12 +84,25 @@ struct State {
 }
 
 pub async fn run(config: AppConfig, client: GitHubClient) -> Result<()> {
-    client.ensure_repo_access().await?;
     let mut terminal = setup_terminal()?;
     let mut state = State::new(config, client);
-    state.load_initial().await;
 
-    let result = run_loop(&mut terminal, &mut state).await;
+    let result = async {
+        terminal.draw(|frame| render(frame, &state))?;
+        state.status = "Connecting to GitHub...".to_string();
+        terminal.draw(|frame| render(frame, &state))?;
+        state.client.ensure_repo_access().await?;
+        state.status = "Loading pull requests...".to_string();
+        terminal.draw(|frame| render(frame, &state))?;
+        state.load_prs(false).await;
+        terminal.draw(|frame| render(frame, &state))?;
+        state.status = "Loading issues...".to_string();
+        terminal.draw(|frame| render(frame, &state))?;
+        state.load_issues(false).await;
+        state.status = "Ready".to_string();
+        run_loop(&mut terminal, &mut state).await
+    }
+    .await;
     restore_terminal(&mut terminal)?;
     result
 }
@@ -118,16 +132,10 @@ impl State {
         }
     }
 
-    async fn load_initial(&mut self) {
-        self.load_prs(false).await;
-        self.load_issues(false).await;
-        self.status = "Ready".to_string();
-    }
-
     async fn load_prs(&mut self, force: bool) {
         let max_age = (!force).then_some(Duration::from_secs(self.config.cache_ttl_seconds));
         if let Some((mut prs, total)) =
-            cache::get_cached_pr_list(&self.config.repo, self.pr_page, max_age)
+            cache::get_cached_pr_list(&self.config.cache, &self.config.repo, self.pr_page, max_age)
         {
             sorting::sort_prs(&mut prs);
             self.prs = prs;
@@ -141,7 +149,13 @@ impl State {
             .await
         {
             Ok((mut prs, total)) => {
-                cache::save_pr_list(&self.config.repo, self.pr_page, &prs, total);
+                cache::save_pr_list(
+                    &self.config.cache,
+                    &self.config.repo,
+                    self.pr_page,
+                    &prs,
+                    total,
+                );
                 sorting::sort_prs(&mut prs);
                 self.prs = prs;
                 self.pr_total = total;
@@ -155,9 +169,13 @@ impl State {
     async fn load_issues(&mut self, force: bool) {
         let direction = if self.issue_newest { "desc" } else { "asc" };
         let max_age = (!force).then_some(Duration::from_secs(self.config.cache_ttl_seconds));
-        if let Some((issues, total)) =
-            cache::get_cached_issue_list(&self.config.repo, self.issue_page, direction, max_age)
-        {
+        if let Some((issues, total)) = cache::get_cached_issue_list(
+            &self.config.cache,
+            &self.config.repo,
+            self.issue_page,
+            direction,
+            max_age,
+        ) {
             self.issues = issues;
             self.issue_total = total;
             return;
@@ -170,6 +188,7 @@ impl State {
         {
             Ok((issues, total)) => {
                 cache::save_issue_list(
+                    &self.config.cache,
                     &self.config.repo,
                     self.issue_page,
                     &issues,
@@ -202,6 +221,7 @@ impl State {
                 };
                 let provider = resolved_provider(&self.config);
                 if let Some(cached) = cache::get_cached_pr_analysis(
+                    &self.config.cache,
                     &self.config.repo,
                     pr.number,
                     &head_sha,
@@ -229,6 +249,7 @@ impl State {
                             &self.config.model,
                             &self.config.base_url,
                             &self.config.api_key_env,
+                            &self.config.cache,
                             &self.config.repo,
                             &self.config.prompt_version,
                         )
@@ -248,6 +269,7 @@ impl State {
                 self.status = format!("Loading issue #{}...", issue.number);
                 let provider = resolved_provider(&self.config);
                 if let Some(cached) = cache::get_cached_issue_analysis(
+                    &self.config.cache,
                     &self.config.repo,
                     issue.number,
                     &provider.provider,
@@ -274,6 +296,7 @@ impl State {
                             &self.config.model,
                             &self.config.base_url,
                             &self.config.api_key_env,
+                            &self.config.cache,
                             &self.config.repo,
                             &self.config.prompt_version,
                         )
@@ -443,44 +466,101 @@ fn render(frame: &mut Frame<'_>, state: &State) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
+            Constraint::Length(3),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(2),
         ])
         .split(area);
 
+    render_header(frame, state, chunks[0]);
+
     let titles = ["Pull Requests", "Issues"]
         .into_iter()
-        .map(Line::from)
+        .map(|title| {
+            Line::from(Span::styled(
+                title,
+                Style::default().add_modifier(Modifier::BOLD),
+            ))
+        })
         .collect::<Vec<_>>();
     let selected = if state.tab == Tab::PullRequests { 0 } else { 1 };
     frame.render_widget(
         Tabs::new(titles)
             .select(selected)
-            .block(
-                Block::default()
-                    .title(format!(" wftt - {} ", state.config.repo))
-                    .borders(Borders::ALL),
-            )
+            .block(panel_block(" Views "))
             .highlight_style(
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
-        chunks[0],
+        chunks[1],
     );
 
     match state.screen {
-        Screen::List => render_list(frame, state, chunks[1]),
-        Screen::Help => render_help(frame, chunks[1]),
-        Screen::Info => render_info(frame, state, chunks[1]),
-        Screen::PrDetail => render_pr_detail(frame, state, chunks[1]),
-        Screen::IssueDetail => render_issue_detail(frame, state, chunks[1]),
-        Screen::Diff => render_diff(frame, state, chunks[1]),
+        Screen::List => render_list(frame, state, chunks[2]),
+        Screen::Help => render_help(frame, chunks[2]),
+        Screen::Info => render_info(frame, state, chunks[2]),
+        Screen::PrDetail => render_pr_detail(frame, state, chunks[2]),
+        Screen::IssueDetail => render_issue_detail(frame, state, chunks[2]),
+        Screen::Diff => render_diff(frame, state, chunks[2]),
     }
 
+    render_footer(frame, state, chunks[3]);
+}
+
+fn render_header(frame: &mut Frame<'_>, state: &State, area: Rect) {
+    let provider = resolved_provider(&state.config);
+    let title = Line::from(vec![
+        Span::styled(
+            " wftt ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            &state.config.repo,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {} / {}", provider.provider, provider.model),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]);
     frame.render_widget(
-        Paragraph::new(state.status.as_str()).style(Style::default().fg(Color::DarkGray)),
-        chunks[2],
+        Paragraph::new(title)
+            .block(panel_block(" GitHub Review Workbench "))
+            .alignment(Alignment::Left),
+        area,
+    );
+}
+
+fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
+    let help = match state.screen {
+        Screen::List => {
+            "Enter open  Tab switch  r refresh  s sort issues  i info  ? help  q q quit"
+        }
+        Screen::PrDetail => "d diff  c copy review  Esc back  q q quit",
+        Screen::IssueDetail => "c copy fix  Esc back  q q quit",
+        Screen::Diff => "Esc back  q q quit",
+        Screen::Help | Screen::Info => "Esc close",
+    };
+    let status = if is_busy_status(&state.status) {
+        format!("{} {}", spinner(), state.status)
+    } else {
+        state.status.clone()
+    };
+    let line = Line::from(vec![
+        Span::styled(status, Style::default().fg(status_color(&state.status))),
+        Span::styled(" | ", Style::default().fg(Color::DarkGray)),
+        Span::styled(help, Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).block(Block::default().borders(Borders::TOP)),
+        area,
     );
 }
 
@@ -495,21 +575,35 @@ fn render_list(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect
             let mut list_state = ListState::default();
             list_state.select((!items.is_empty()).then_some(state.selected_pr));
             let total_pages = pages(state.pr_total);
-            frame.render_stateful_widget(
-                List::new(items)
-                    .block(
-                        Block::default()
-                            .title(format!(
-                                " Pull Requests - Page {} / {} ",
-                                state.pr_page + 1,
-                                total_pages
-                            ))
-                            .borders(Borders::ALL),
-                    )
-                    .highlight_style(Style::default().bg(Color::DarkGray)),
-                area,
-                &mut list_state,
+            let title = format!(
+                " Pull Requests  page {} / {}  total {} ",
+                state.pr_page + 1,
+                total_pages,
+                state.pr_total
             );
+            if items.is_empty() {
+                render_empty_state(
+                    frame,
+                    area,
+                    &title,
+                    "No open pull requests were returned.",
+                    &state.status,
+                );
+            } else {
+                frame.render_stateful_widget(
+                    List::new(items)
+                        .block(panel_block(&title))
+                        .highlight_style(
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .highlight_symbol(" > "),
+                    area,
+                    &mut list_state,
+                );
+            }
         }
         Tab::Issues => {
             let items = state.issues.iter().map(issue_item).collect::<Vec<_>>();
@@ -520,30 +614,111 @@ fn render_list(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect
             } else {
                 "Oldest first"
             };
-            frame.render_stateful_widget(
-                List::new(items)
-                    .block(
-                        Block::default()
-                            .title(format!(
-                                " Issues - {order} - Page {} / {} ",
-                                state.issue_page + 1,
-                                pages(state.issue_total)
-                            ))
-                            .borders(Borders::ALL),
-                    )
-                    .highlight_style(Style::default().bg(Color::DarkGray)),
-                area,
-                &mut list_state,
+            let title = format!(
+                " Issues  {order}  page {} / {}  total {} ",
+                state.issue_page + 1,
+                pages(state.issue_total),
+                state.issue_total
             );
+            if items.is_empty() {
+                render_empty_state(
+                    frame,
+                    area,
+                    &title,
+                    "No open issues were returned.",
+                    &state.status,
+                );
+            } else {
+                frame.render_stateful_widget(
+                    List::new(items)
+                        .block(panel_block(&title))
+                        .highlight_style(
+                            Style::default()
+                                .fg(Color::Black)
+                                .bg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )
+                        .highlight_symbol(" > "),
+                    area,
+                    &mut list_state,
+                );
+            }
         }
     }
 }
 
+fn panel_block(title: &str) -> Block<'_> {
+    Block::default()
+        .title(title.to_string())
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+}
+
+fn render_empty_state(frame: &mut Frame<'_>, area: Rect, title: &str, message: &str, status: &str) {
+    let text = Text::from(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            message,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            status,
+            Style::default().fg(status_color(status)),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press r to refresh. Press ? for help.",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ]);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(panel_block(title))
+            .alignment(Alignment::Center),
+        area,
+    );
+}
+
+fn status_color(status: &str) -> Color {
+    let lower = status.to_lowercase();
+    if lower.contains("failed") || lower.contains("error") {
+        Color::Red
+    } else if is_busy_status(status) {
+        Color::Yellow
+    } else {
+        Color::Green
+    }
+}
+
+fn is_busy_status(status: &str) -> bool {
+    let lower = status.to_lowercase();
+    lower.contains("loading") || lower.contains("fetching") || lower.contains("connecting")
+}
+
+fn spinner() -> &'static str {
+    const FRAMES: [&str; 4] = ["|", "/", "-", "\\"];
+    let tick = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| (duration.as_millis() / 180) as usize)
+        .unwrap_or(0);
+    FRAMES[tick % FRAMES.len()]
+}
+
 fn pr_item(pr: &PrData, watch_paths: &[WatchedPathConfig]) -> ListItem<'static> {
-    let size = match pr.size() {
-        PrSize::XS | PrSize::S => Color::Green,
-        PrSize::M => Color::Yellow,
-        PrSize::L | PrSize::XL => Color::Red,
+    let (size_label, size_color) = match pr.size_if_known() {
+        Some(PrSize::XS) | Some(PrSize::S) => (format!("{:?}", pr.size()), Color::Green),
+        Some(PrSize::M) => (format!("{:?}", pr.size()), Color::Yellow),
+        Some(PrSize::L) | Some(PrSize::XL) => (format!("{:?}", pr.size()), Color::Red),
+        None => ("--".to_string(), Color::DarkGray),
     };
     let author = if pr.is_dependabot {
         "BOT".to_string()
@@ -568,8 +743,8 @@ fn pr_item(pr: &PrData, watch_paths: &[WatchedPathConfig]) -> ListItem<'static> 
             Style::default().fg(Color::DarkGray),
         ),
         Span::styled(
-            format!("  {:?}", pr.size()),
-            Style::default().fg(size).add_modifier(Modifier::BOLD),
+            format!("  {size_label}"),
+            Style::default().fg(size_color).add_modifier(Modifier::BOLD),
         ),
     ]))
 }
@@ -741,7 +916,7 @@ fn render_info(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect
     };
     let provider = resolved_provider(&state.config);
     let text = format!(
-        "Repository: {}\nProvider: {}\nModel: {}\nBase URL: {}\nAPI Key Env: {}\nPrompt Version: {}\nCache TTL: {}s\nPoll Interval: {}s\nConfig:\n{}",
+        "Repository: {}\nProvider: {}\nModel: {}\nBase URL: {}\nAPI Key Env: {}\nPrompt Version: {}\nCache Enabled: {}\nCache Dir: {}\nAnalysis TTL: {}d\nCache Max: {} MB\nList Cache TTL: {}s\nPoll Interval: {}s\nConfig:\n{}",
         state.config.repo,
         provider.provider,
         provider.model,
@@ -752,6 +927,10 @@ fn render_info(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect
             &provider.api_key_env
         },
         state.config.prompt_version,
+        state.config.cache.enabled,
+        cache::cache_dir(&state.config.cache).display(),
+        state.config.cache.analysis_ttl_days,
+        state.config.cache.max_size_mb,
         state.config.cache_ttl_seconds,
         state.config.poll_interval_seconds,
         config_paths

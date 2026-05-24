@@ -318,8 +318,11 @@ struct PullResponse {
     number: u64,
     title: String,
     user: Option<UserResponse>,
+    #[serde(default)]
     additions: i64,
+    #[serde(default)]
     deletions: i64,
+    #[serde(default)]
     changed_files: i64,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
@@ -437,4 +440,31 @@ struct CheckRunResponse {
 #[derive(Debug, Deserialize)]
 struct CombinedStatusResponse {
     state: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pull_list_response_defaults_detail_only_counts() {
+        let json = r##"
+        {
+          "number": 42,
+          "title": "Improve terminal UI",
+          "user": {"login": "octocat", "type": "User"},
+          "created_at": "2026-05-24T08:00:00Z",
+          "updated_at": "2026-05-24T08:30:00Z",
+          "head": {"sha": "abc123"},
+          "body": "hello",
+          "labels": []
+        }
+        "##;
+        let pr: PullResponse = serde_json::from_str(json).unwrap();
+        let data = pr.into_pr_data(CiStatus::Unknown, Vec::new());
+        assert_eq!(data.number, 42);
+        assert_eq!(data.additions, 0);
+        assert_eq!(data.deletions, 0);
+        assert_eq!(data.changed_files, 0);
+    }
 }

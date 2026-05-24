@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use crate::{
     cache,
+    config::CacheConfig,
     models::{IssueAnalysis, IssueDetail, IssueSeverity, PrAnalysis, PrDetail},
 };
 
@@ -94,6 +95,11 @@ pub trait RestProvider {
 
 struct GeminiProvider;
 struct OllamaProvider;
+struct OpenAiCompatibleProvider {
+    default_model: &'static str,
+    default_base_url: &'static str,
+    default_api_key_env: &'static str,
+}
 
 impl RestProvider for GeminiProvider {
     fn default_model(&self) -> &'static str {
@@ -181,6 +187,52 @@ impl RestProvider for OllamaProvider {
     }
 }
 
+impl RestProvider for OpenAiCompatibleProvider {
+    fn default_model(&self) -> &'static str {
+        self.default_model
+    }
+
+    fn default_base_url(&self) -> &'static str {
+        self.default_base_url
+    }
+
+    fn default_api_key_env(&self) -> &'static str {
+        self.default_api_key_env
+    }
+
+    fn complete<'a>(
+        &'a self,
+        config: &'a ProviderConfig,
+        prompt: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + Send + 'a>> {
+        Box::pin(async move {
+            let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
+            let mut request = Client::new().post(url).json(&json!({
+                "model": config.model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": prompt,
+                    }
+                ],
+                "temperature": 0.2,
+            }));
+            if !config.api_key_env.trim().is_empty() {
+                let api_key = env::var(&config.api_key_env).with_context(|| {
+                    format!("{} environment variable is required", config.api_key_env)
+                })?;
+                request = request.bearer_auth(api_key);
+            }
+            let response: Value = request.send().await?.error_for_status()?.json().await?;
+            Ok(response
+                .pointer("/choices/0/message/content")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string())
+        })
+    }
+}
+
 pub fn resolve_provider_config(
     provider: &str,
     model: &str,
@@ -249,12 +301,14 @@ pub async fn analyze_pr(
     model: &str,
     base_url: &str,
     api_key_env: &str,
+    cache_config: &CacheConfig,
     repo: &str,
     prompt_version: &str,
 ) -> PrAnalysis {
     let config = resolve_provider_config(provider, model, base_url, api_key_env);
     if !repo.is_empty() && !pr_detail.pr.head_sha.is_empty() {
         if let Some(cached) = cache::get_cached_pr_analysis(
+            cache_config,
             repo,
             pr_detail.pr.number,
             &pr_detail.pr.head_sha,
@@ -297,6 +351,7 @@ pub async fn analyze_pr(
 
     if !repo.is_empty() && !pr_detail.pr.head_sha.is_empty() {
         cache::save_pr_analysis(
+            cache_config,
             repo,
             pr_detail.pr.number,
             &pr_detail.pr.head_sha,
@@ -316,12 +371,14 @@ pub async fn analyze_issue(
     model: &str,
     base_url: &str,
     api_key_env: &str,
+    cache_config: &CacheConfig,
     repo: &str,
     prompt_version: &str,
 ) -> IssueAnalysis {
     let config = resolve_provider_config(provider, model, base_url, api_key_env);
     if !repo.is_empty() {
         if let Some(cached) = cache::get_cached_issue_analysis(
+            cache_config,
             repo,
             issue_detail.issue.number,
             &config.provider,
@@ -360,6 +417,7 @@ pub async fn analyze_issue(
 
     if !repo.is_empty() {
         cache::save_issue_analysis(
+            cache_config,
             repo,
             issue_detail.issue.number,
             &serde_json::to_value(&analysis).unwrap_or_else(|_| json!({})),
@@ -383,6 +441,26 @@ fn provider_by_name(provider: &str) -> Option<Box<dyn RestProvider + Send + Sync
     match provider {
         "gemini" => Some(Box::new(GeminiProvider)),
         "ollama" => Some(Box::new(OllamaProvider)),
+        "openai" | "openai-compatible" => Some(Box::new(OpenAiCompatibleProvider {
+            default_model: "gpt-4o-mini",
+            default_base_url: "https://api.openai.com/v1",
+            default_api_key_env: "OPENAI_API_KEY",
+        })),
+        "openrouter" => Some(Box::new(OpenAiCompatibleProvider {
+            default_model: "openai/gpt-4o-mini",
+            default_base_url: "https://openrouter.ai/api/v1",
+            default_api_key_env: "OPENROUTER_API_KEY",
+        })),
+        "lmstudio" => Some(Box::new(OpenAiCompatibleProvider {
+            default_model: "local-model",
+            default_base_url: "http://localhost:1234/v1",
+            default_api_key_env: "",
+        })),
+        "vllm" => Some(Box::new(OpenAiCompatibleProvider {
+            default_model: "local-model",
+            default_base_url: "http://localhost:8000/v1",
+            default_api_key_env: "",
+        })),
         _ => None,
     }
 }
@@ -556,5 +634,22 @@ mod tests {
         let config = resolve_provider_config("gemini", "ollama/qwen2.5-coder", "", "");
         assert_eq!(config.provider, "ollama");
         assert_eq!(config.model, "qwen2.5-coder");
+    }
+
+    #[test]
+    fn resolves_openrouter_namespaced_model() {
+        let config = resolve_provider_config("", "openrouter/anthropic/claude-3.5-sonnet", "", "");
+        assert_eq!(config.provider, "openrouter");
+        assert_eq!(config.model, "anthropic/claude-3.5-sonnet");
+        assert_eq!(config.base_url, "https://openrouter.ai/api/v1");
+        assert_eq!(config.api_key_env, "OPENROUTER_API_KEY");
+    }
+
+    #[test]
+    fn resolves_lmstudio_defaults() {
+        let config = resolve_provider_config("lmstudio", "", "", "");
+        assert_eq!(config.provider, "lmstudio");
+        assert_eq!(config.base_url, "http://localhost:1234/v1");
+        assert_eq!(config.api_key_env, "");
     }
 }

@@ -10,13 +10,16 @@ pub fn pr_sort_score(pr: &PrData) -> f64 {
         CiStatus::Failing => 1.0,
     };
 
-    let lines = pr.lines_changed();
-    let size_score = match lines {
-        n if n < 10 => 0.0,
-        n if n < 50 => 0.2,
-        n if n < 200 => 0.5,
-        n if n < 500 => 0.8,
-        _ => 1.0,
+    let size_score = if pr.change_stats_known() {
+        match pr.lines_changed() {
+            n if n < 10 => 0.0,
+            n if n < 50 => 0.2,
+            n if n < 200 => 0.5,
+            n if n < 500 => 0.8,
+            _ => 1.0,
+        }
+    } else {
+        0.6
     };
 
     let age_days = (Utc::now() - pr.created_at).num_days();

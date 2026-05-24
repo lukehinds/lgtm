@@ -50,6 +50,28 @@ impl Default for GitHubConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
+pub struct CacheConfig {
+    pub enabled: bool,
+    pub dir: String,
+    pub analysis_ttl_days: u64,
+    pub review_input_ttl_days: u64,
+    pub max_size_mb: u64,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: "~/.cache/gitnit".to_string(),
+            analysis_ttl_days: 30,
+            review_input_ttl_days: 14,
+            max_size_mb: 2048,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
 pub struct WatchedPathConfig {
     pub path: String,
     pub label: String,
@@ -77,6 +99,7 @@ pub struct WatchConfig {
 pub struct GitNitConfig {
     pub ai: AiConfig,
     pub github: GitHubConfig,
+    pub cache: CacheConfig,
     pub watch: WatchConfig,
     #[serde(skip)]
     pub loaded_paths: Vec<PathBuf>,
@@ -87,6 +110,7 @@ impl Default for GitNitConfig {
         Self {
             ai: AiConfig::default(),
             github: GitHubConfig::default(),
+            cache: CacheConfig::default(),
             watch: WatchConfig::default(),
             loaded_paths: Vec::new(),
         }
@@ -223,6 +247,31 @@ mod tests {
         let config = load_config(Some(&path), Some(&dir)).unwrap();
         assert_eq!(config.watch.paths.len(), 1);
         assert_eq!(config.watch.paths[0].path, "src");
+    }
+
+    #[test]
+    fn loads_cache_config() {
+        let dir = tempfile_path().join("cache-config");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("gitnit.toml");
+        fs::write(
+            &path,
+            r#"
+            [cache]
+            enabled = false
+            dir = "/tmp/wftt-cache-test"
+            analysis_ttl_days = 7
+            review_input_ttl_days = 3
+            max_size_mb = 128
+            "#,
+        )
+        .unwrap();
+        let config = load_config(Some(&path), Some(&dir)).unwrap();
+        assert!(!config.cache.enabled);
+        assert_eq!(config.cache.dir, "/tmp/wftt-cache-test");
+        assert_eq!(config.cache.analysis_ttl_days, 7);
+        assert_eq!(config.cache.review_input_ttl_days, 3);
+        assert_eq!(config.cache.max_size_mb, 128);
     }
 
     fn tempfile_path() -> PathBuf {

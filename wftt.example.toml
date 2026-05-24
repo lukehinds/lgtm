@@ -1,0 +1,62 @@
+[ai]
+# Either set provider and model separately:
+provider = "gemini"
+model = "gemini-2.5-pro"
+prompt_version = "v3"
+
+# Or use namespaced model notation. This overrides provider.
+# model = "ollama/llama3.1"
+# model = "openrouter/anthropic/claude-3.5-sonnet"
+
+# Optional overrides. Provider defaults are used when blank.
+base_url = ""
+api_key_env = ""
+
+[github]
+repo = "owner/repo"
+cache_ttl_seconds = 600
+poll_interval_seconds = 300
+
+[cache]
+enabled = true
+dir = "~/.cache/gitnit"
+analysis_ttl_days = 30
+review_input_ttl_days = 14
+max_size_mb = 2048
+
+# Provider examples:
+#
+# Gemini:
+# [ai]
+# provider = "gemini"
+# model = "gemini-2.5-pro"
+# api_key_env = "GEMINI_API_KEY"
+#
+# Ollama:
+# [ai]
+# provider = "ollama"
+# model = "llama3.1"
+# base_url = "http://localhost:11434"
+#
+# OpenAI:
+# [ai]
+# provider = "openai"
+# model = "gpt-4o-mini"
+# api_key_env = "OPENAI_API_KEY"
+#
+# OpenRouter:
+# [ai]
+# provider = "openrouter"
+# model = "anthropic/claude-3.5-sonnet"
+# api_key_env = "OPENROUTER_API_KEY"
+#
+# LM Studio:
+# [ai]
+# provider = "lmstudio"
+# model = "local-model"
+# base_url = "http://localhost:1234/v1"
+
+[watch]
+paths = [
+  { path = "src/app/security", label = "security", color = "red" },
+]

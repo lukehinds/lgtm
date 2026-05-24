@@ -76,6 +76,17 @@ async fn main() -> Result<()> {
         println!("ai.base_url = {}", resolved_ai.base_url);
         println!("ai.api_key_env = {}", resolved_ai.api_key_env);
         println!("ai.prompt_version = {}", config.ai.prompt_version);
+        println!("cache.enabled = {}", config.cache.enabled);
+        println!("cache.dir = {}", config.cache.dir);
+        println!(
+            "cache.analysis_ttl_days = {}",
+            config.cache.analysis_ttl_days
+        );
+        println!(
+            "cache.review_input_ttl_days = {}",
+            config.cache.review_input_ttl_days
+        );
+        println!("cache.max_size_mb = {}", config.cache.max_size_mb);
         println!(
             "github.cache_ttl_seconds = {}",
             config.github.cache_ttl_seconds
@@ -108,6 +119,7 @@ async fn main() -> Result<()> {
             base_url,
             api_key_env,
             prompt_version: config.ai.prompt_version,
+            cache: config.cache,
             cache_ttl_seconds: config.github.cache_ttl_seconds,
             poll_interval_seconds: config.github.poll_interval_seconds,
             config_paths: config.loaded_paths,
