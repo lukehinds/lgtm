@@ -5,6 +5,9 @@ use std::{
     time::Duration,
 };
 
+mod diff;
+mod logic;
+
 use chrono::{DateTime, Utc};
 
 use anyhow::Result;
@@ -28,6 +31,9 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
     task::JoinHandle,
 };
+
+use diff::{DiffFile, DiffHunk, current_diff_file, display_diff_path, parse_diff};
+use logic::{find_line_after, item_visible, offset_index};
 
 use crate::{
     ai, cache,
@@ -101,19 +107,6 @@ enum Screen {
     PrDetail,
     IssueDetail,
     Diff,
-}
-
-#[derive(Debug, Clone)]
-struct DiffFile {
-    old_path: String,
-    new_path: String,
-    start_line: usize,
-}
-
-#[derive(Debug, Clone)]
-struct DiffHunk {
-    file_index: usize,
-    start_line: usize,
 }
 
 enum DetailLoadResult {
@@ -1123,22 +1116,6 @@ fn visible_issue_indices(state: &State, provider: &ai::ProviderConfig) -> Vec<us
         .collect()
 }
 
-fn item_visible(cached: bool, filter: CacheFilter, query: &str, fields: &[&str]) -> bool {
-    let cache_ok = match filter {
-        CacheFilter::All => true,
-        CacheFilter::Cached => cached,
-        CacheFilter::Uncached => !cached,
-    };
-    if !cache_ok {
-        return false;
-    }
-    let query = query.trim().to_lowercase();
-    query.is_empty()
-        || fields
-            .iter()
-            .any(|field| field.to_lowercase().contains(&query))
-}
-
 fn pr_has_cached_analysis(state: &State, pr: &PrData, provider: &ai::ProviderConfig) -> bool {
     !pr.head_sha.is_empty()
         && cache::get_cached_pr_analysis(
@@ -1459,14 +1436,6 @@ fn search_next_in_detail(state: &mut State) {
     }
 }
 
-fn find_line_after(text: &str, query: &str, start: usize) -> Option<usize> {
-    text.lines()
-        .enumerate()
-        .skip(start)
-        .find(|(_, line)| line.to_lowercase().contains(query))
-        .map(|(index, _)| index)
-}
-
 fn pr_sort_label(sort: PrSort) -> &'static str {
     match sort {
         PrSort::Smart => "smart",
@@ -1546,136 +1515,6 @@ fn sync_diff_position(state: &mut State, files: &[DiffFile], hunks: &[DiffHunk])
         .find(|(_, hunk)| hunk.start_line <= scroll)
     {
         state.diff_hunk_index = index;
-    }
-}
-
-fn offset_index(current: usize, delta: isize, max: usize) -> usize {
-    if delta.is_negative() {
-        current.saturating_sub(delta.unsigned_abs())
-    } else {
-        current.saturating_add(delta as usize).min(max)
-    }
-}
-
-fn parse_diff(diff: &str) -> (Vec<Line<'static>>, Vec<DiffFile>, Vec<DiffHunk>) {
-    let mut lines = Vec::new();
-    let mut files = Vec::new();
-    let mut hunks = Vec::new();
-    let mut current_file: Option<usize> = None;
-    let mut pending_old_path: Option<String> = None;
-
-    for raw_line in diff.lines() {
-        let line_index = lines.len();
-        if let Some(rest) = raw_line.strip_prefix("diff --git ") {
-            let (old_path, new_path) = parse_diff_git_paths(rest);
-            files.push(DiffFile {
-                old_path,
-                new_path,
-                start_line: line_index,
-            });
-            current_file = Some(files.len() - 1);
-            pending_old_path = None;
-            lines.push(styled_diff_line(raw_line));
-            continue;
-        }
-        if let Some(path) = raw_line.strip_prefix("--- ") {
-            pending_old_path = Some(trim_diff_path(path));
-            lines.push(styled_diff_line(raw_line));
-            continue;
-        }
-        if let Some(path) = raw_line.strip_prefix("+++ ") {
-            if current_file.is_none() {
-                let old_path = pending_old_path
-                    .take()
-                    .unwrap_or_else(|| "unknown".to_string());
-                files.push(DiffFile {
-                    old_path,
-                    new_path: trim_diff_path(path),
-                    start_line: line_index.saturating_sub(1),
-                });
-                current_file = Some(files.len() - 1);
-            }
-            lines.push(styled_diff_line(raw_line));
-            continue;
-        }
-        if raw_line.starts_with("@@") {
-            let file_index = current_file.unwrap_or_else(|| {
-                files.push(DiffFile {
-                    old_path: "unknown".to_string(),
-                    new_path: "unknown".to_string(),
-                    start_line: line_index,
-                });
-                files.len() - 1
-            });
-            hunks.push(DiffHunk {
-                file_index,
-                start_line: line_index,
-            });
-        }
-        lines.push(styled_diff_line(raw_line));
-    }
-
-    if lines.is_empty() {
-        lines.push(Line::from("No diff available."));
-    }
-    (lines, files, hunks)
-}
-
-fn styled_diff_line(line: &str) -> Line<'static> {
-    let style = if line.starts_with("diff --git ") {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    } else if line.starts_with("@@") {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else if line.starts_with("+++") || line.starts_with("---") {
-        Style::default().fg(Color::LightBlue)
-    } else if line.starts_with('+') {
-        Style::default().fg(Color::Green)
-    } else if line.starts_with('-') {
-        Style::default().fg(Color::Red)
-    } else if line.starts_with("index ")
-        || line.starts_with("new file mode")
-        || line.starts_with("deleted file mode")
-        || line.starts_with("similarity index")
-        || line.starts_with("rename from")
-        || line.starts_with("rename to")
-    {
-        Style::default().fg(TEXT_SECONDARY)
-    } else {
-        Style::default().fg(TEXT_PRIMARY)
-    };
-    Line::from(Span::styled(line.to_string(), style))
-}
-
-fn parse_diff_git_paths(rest: &str) -> (String, String) {
-    let mut parts = rest.split_whitespace();
-    let old_path = parts.next().map(trim_diff_path).unwrap_or_default();
-    let new_path = parts.next().map(trim_diff_path).unwrap_or_default();
-    (old_path, new_path)
-}
-
-fn trim_diff_path(path: &str) -> String {
-    path.trim()
-        .trim_matches('"')
-        .trim_start_matches("a/")
-        .trim_start_matches("b/")
-        .to_string()
-}
-
-fn current_diff_file<'a>(state: &State, files: &'a [DiffFile]) -> Option<&'a DiffFile> {
-    files.get(state.diff_file_index).or_else(|| files.first())
-}
-
-fn display_diff_path(file: &DiffFile) -> String {
-    if file.old_path == file.new_path || file.old_path == "/dev/null" {
-        file.new_path.clone()
-    } else if file.new_path == "/dev/null" {
-        file.old_path.clone()
-    } else {
-        format!("{} -> {}", file.old_path, file.new_path)
     }
 }
 
@@ -2152,7 +1991,7 @@ fn render_diff(frame: &mut Frame<'_>, state: &mut State, area: ratatui::layout::
     if let Some(file_area) = file_area {
         render_diff_file_panel(frame, file_area, &files, state.diff_file_index);
     }
-    if let Some(file) = current_diff_file(state, &files) {
+    if let Some(file) = current_diff_file(state.diff_file_index, &files) {
         let file_hunks = hunks
             .iter()
             .filter(|hunk| hunk.file_index == state.diff_file_index)
