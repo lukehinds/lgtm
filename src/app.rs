@@ -83,6 +83,7 @@ struct State {
     selected_pr: usize,
     selected_issue: usize,
     issue_newest: bool,
+    pr_smart_sort: bool,
     status: String,
     pr_detail: Option<PrDetail>,
     pr_analysis: Option<PrAnalysis>,
@@ -131,6 +132,7 @@ impl State {
             selected_pr: 0,
             selected_issue: 0,
             issue_newest: true,
+            pr_smart_sort: true,
             status: "Loading repository data...".to_string(),
             pr_detail: None,
             pr_analysis: None,
@@ -140,15 +142,27 @@ impl State {
         }
     }
 
+    fn apply_pr_sort(&self, prs: &mut Vec<PrData>) {
+        if self.pr_smart_sort {
+            sorting::sort_prs(prs);
+        } else {
+            prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        }
+    }
+
     async fn load_prs(&mut self, force: bool) {
-        let max_age = (!force).then_some(Duration::from_secs(self.config.cache_ttl_seconds));
-        if let Some((mut prs, total)) =
-            cache::get_cached_pr_list(&self.config.cache, &self.config.repo, self.pr_page, max_age)
-        {
-            sorting::sort_prs(&mut prs);
-            self.prs = prs;
-            self.pr_total = total;
-            return;
+        if !force {
+            if let Some((mut prs, total)) = cache::get_cached_pr_list(
+                &self.config.cache,
+                &self.config.repo,
+                self.pr_page,
+                Some(Duration::from_secs(self.config.cache_ttl_seconds)),
+            ) {
+                self.apply_pr_sort(&mut prs);
+                self.prs = prs;
+                self.pr_total = total;
+                return;
+            }
         }
         self.status = "Fetching pull requests...".to_string();
         match self
@@ -164,7 +178,7 @@ impl State {
                     &prs,
                     total,
                 );
-                sorting::sort_prs(&mut prs);
+                self.apply_pr_sort(&mut prs);
                 self.prs = prs;
                 self.pr_total = total;
                 self.selected_pr = self.selected_pr.min(self.prs.len().saturating_sub(1));
@@ -176,17 +190,18 @@ impl State {
 
     async fn load_issues(&mut self, force: bool) {
         let direction = if self.issue_newest { "desc" } else { "asc" };
-        let max_age = (!force).then_some(Duration::from_secs(self.config.cache_ttl_seconds));
-        if let Some((issues, total)) = cache::get_cached_issue_list(
-            &self.config.cache,
-            &self.config.repo,
-            self.issue_page,
-            direction,
-            max_age,
-        ) {
-            self.issues = issues;
-            self.issue_total = total;
-            return;
+        if !force {
+            if let Some((issues, total)) = cache::get_cached_issue_list(
+                &self.config.cache,
+                &self.config.repo,
+                self.issue_page,
+                direction,
+                Some(Duration::from_secs(self.config.cache_ttl_seconds)),
+            ) {
+                self.issues = issues;
+                self.issue_total = total;
+                return;
+            }
         }
         self.status = "Fetching issues...".to_string();
         match self
@@ -565,12 +580,20 @@ fn hint_spans(pairs: &[(&'static str, &'static str)]) -> Vec<Span<'static>> {
 
 fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
     let help_spans: Vec<Span<'static>> = match state.screen {
-        Screen::List => hint_spans(&[
+        Screen::List if state.tab == Tab::PullRequests => hint_spans(&[
             ("Enter", "open"),
             ("Tab", "switch"),
             ("r", "refresh"),
             ("s", "sort"),
             ("i", "info"),
+            ("?", "help"),
+            ("q q", "quit"),
+        ]),
+        Screen::List => hint_spans(&[
+            ("Enter", "open"),
+            ("Tab", "switch"),
+            ("r", "refresh"),
+            ("s", "newest/oldest"),
             ("?", "help"),
             ("q q", "quit"),
         ]),
