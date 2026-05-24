@@ -15,11 +15,15 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout, Margin, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span, Text},
-    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
+    widgets::{
+        Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Scrollbar,
+        ScrollbarOrientation, ScrollbarState, Tabs, Wrap,
+    },
 };
+use tokio::task::JoinHandle;
 
 use crate::{
     ai, cache,
@@ -62,11 +66,25 @@ enum Tab {
 #[derive(Debug, Clone)]
 enum Screen {
     List,
+    Loading,
     Help,
     Info,
     PrDetail,
     IssueDetail,
     Diff,
+}
+
+enum DetailLoadResult {
+    Pr {
+        detail: PrDetail,
+        analysis: PrAnalysis,
+        status: String,
+    },
+    Issue {
+        detail: IssueDetail,
+        analysis: IssueAnalysis,
+        status: String,
+    },
 }
 
 struct State {
@@ -89,6 +107,10 @@ struct State {
     pr_analysis: Option<PrAnalysis>,
     issue_detail: Option<IssueDetail>,
     issue_analysis: Option<IssueAnalysis>,
+    detail_task: Option<JoinHandle<std::result::Result<DetailLoadResult, String>>>,
+    pr_detail_scroll: u16,
+    issue_detail_scroll: u16,
+    diff_scroll: u16,
     quit_armed: bool,
 }
 
@@ -138,6 +160,10 @@ impl State {
             pr_analysis: None,
             issue_detail: None,
             issue_analysis: None,
+            detail_task: None,
+            pr_detail_scroll: 0,
+            issue_detail_scroll: 0,
+            diff_scroll: 0,
             quit_armed: false,
         }
     }
@@ -227,113 +253,189 @@ impl State {
         }
     }
 
-    async fn open_selected(&mut self) {
+    fn open_selected(&mut self) {
+        if self.detail_task.is_some() {
+            return;
+        }
         match self.tab {
             Tab::PullRequests => {
                 let Some(pr) = self.prs.get(self.selected_pr).cloned() else {
                     return;
                 };
                 self.status = format!("Loading PR #{}...", pr.number);
-                let head_sha = if pr.head_sha.is_empty() {
-                    self.client
-                        .get_pr_head_sha(pr.number)
-                        .await
-                        .unwrap_or_default()
-                } else {
-                    pr.head_sha.clone()
-                };
-                let provider = resolved_provider(&self.config);
-                if let Some(cached) = cache::get_cached_pr_analysis(
-                    &self.config.cache,
-                    &self.config.repo,
-                    pr.number,
-                    &head_sha,
-                    &provider.provider,
-                    &provider.model,
-                    &self.config.prompt_version,
-                    "pr-analysis-v1",
-                ) {
-                    match self.client.get_pr_summary(pr.number, false).await {
-                        Ok(detail) => {
-                            self.pr_detail = Some(detail);
-                            self.pr_analysis = Some(ai::pr_analysis_from_value(&cached));
-                            self.screen = Screen::PrDetail;
-                            self.status = "PR analysis loaded from cache".to_string();
-                        }
-                        Err(err) => self.status = format!("Failed to load PR metadata: {err}"),
-                    }
-                    return;
-                }
-                match self.client.get_pr_detail(pr.number).await {
-                    Ok(detail) => {
-                        let analysis = ai::analyze_pr(
-                            &detail,
-                            &self.config.provider,
-                            &self.config.model,
-                            &self.config.base_url,
-                            &self.config.api_key_env,
-                            &self.config.cache,
-                            &self.config.repo,
-                            &self.config.prompt_version,
-                        )
-                        .await;
-                        self.pr_detail = Some(detail);
-                        self.pr_analysis = Some(analysis);
-                        self.screen = Screen::PrDetail;
-                        self.status = "PR analysis loaded".to_string();
-                    }
-                    Err(err) => self.status = format!("Failed to load PR: {err}"),
-                }
+                self.screen = Screen::Loading;
+                self.pr_detail = None;
+                self.pr_analysis = None;
+                self.pr_detail_scroll = 0;
+                self.diff_scroll = 0;
+                let client = self.client.clone();
+                let config = self.config.clone();
+                self.detail_task = Some(tokio::spawn(async move {
+                    load_pr_detail(client, config, pr).await
+                }));
             }
             Tab::Issues => {
                 let Some(issue) = self.issues.get(self.selected_issue).cloned() else {
                     return;
                 };
                 self.status = format!("Loading issue #{}...", issue.number);
-                let provider = resolved_provider(&self.config);
-                if let Some(cached) = cache::get_cached_issue_analysis(
-                    &self.config.cache,
-                    &self.config.repo,
-                    issue.number,
-                    &provider.provider,
-                    &provider.model,
-                    &self.config.prompt_version,
-                    "issue-analysis-v1",
-                ) {
-                    match self.client.get_issue_summary(issue.number).await {
-                        Ok(detail) => {
-                            self.issue_detail = Some(detail);
-                            self.issue_analysis = Some(ai::issue_analysis_from_value(&cached));
-                            self.screen = Screen::IssueDetail;
-                            self.status = "Issue analysis loaded from cache".to_string();
-                        }
-                        Err(err) => self.status = format!("Failed to load issue metadata: {err}"),
-                    }
-                    return;
-                }
-                match self.client.get_issue_detail(issue.number).await {
-                    Ok(detail) => {
-                        let analysis = ai::analyze_issue(
-                            &detail,
-                            &self.config.provider,
-                            &self.config.model,
-                            &self.config.base_url,
-                            &self.config.api_key_env,
-                            &self.config.cache,
-                            &self.config.repo,
-                            &self.config.prompt_version,
-                        )
-                        .await;
-                        self.issue_detail = Some(detail);
-                        self.issue_analysis = Some(analysis);
-                        self.screen = Screen::IssueDetail;
-                        self.status = "Issue analysis loaded".to_string();
-                    }
-                    Err(err) => self.status = format!("Failed to load issue: {err}"),
-                }
+                self.screen = Screen::Loading;
+                self.issue_detail = None;
+                self.issue_analysis = None;
+                self.issue_detail_scroll = 0;
+                let client = self.client.clone();
+                let config = self.config.clone();
+                self.detail_task = Some(tokio::spawn(async move {
+                    load_issue_detail(client, config, issue).await
+                }));
             }
         }
     }
+
+    async fn complete_detail_load(&mut self) {
+        let Some(task) = self.detail_task.as_ref() else {
+            return;
+        };
+        if !task.is_finished() {
+            return;
+        }
+        let Some(task) = self.detail_task.take() else {
+            return;
+        };
+        match task.await {
+            Ok(Ok(DetailLoadResult::Pr {
+                detail,
+                analysis,
+                status,
+            })) => {
+                self.pr_detail = Some(detail);
+                self.pr_analysis = Some(analysis);
+                self.pr_detail_scroll = 0;
+                self.diff_scroll = 0;
+                self.screen = Screen::PrDetail;
+                self.status = status;
+            }
+            Ok(Ok(DetailLoadResult::Issue {
+                detail,
+                analysis,
+                status,
+            })) => {
+                self.issue_detail = Some(detail);
+                self.issue_analysis = Some(analysis);
+                self.issue_detail_scroll = 0;
+                self.screen = Screen::IssueDetail;
+                self.status = status;
+            }
+            Ok(Err(err)) => {
+                self.screen = Screen::List;
+                self.status = err;
+            }
+            Err(err) => {
+                self.screen = Screen::List;
+                self.status = format!("Detail load failed: {err}");
+            }
+        }
+    }
+}
+
+async fn load_pr_detail(
+    client: GitHubClient,
+    config: AppConfig,
+    pr: PrData,
+) -> std::result::Result<DetailLoadResult, String> {
+    let head_sha = if pr.head_sha.is_empty() {
+        client.get_pr_head_sha(pr.number).await.unwrap_or_default()
+    } else {
+        pr.head_sha.clone()
+    };
+    let provider = resolved_provider(&config);
+    if let Some(cached) = cache::get_cached_pr_analysis(
+        &config.cache,
+        &config.repo,
+        pr.number,
+        &head_sha,
+        &provider.provider,
+        &provider.model,
+        &config.prompt_version,
+        "pr-analysis-v1",
+    ) {
+        let detail = client
+            .get_pr_summary(pr.number, false)
+            .await
+            .map_err(|err| format!("Failed to load PR metadata: {err}"))?;
+        return Ok(DetailLoadResult::Pr {
+            detail,
+            analysis: ai::pr_analysis_from_value(&cached),
+            status: "PR analysis loaded from cache".to_string(),
+        });
+    }
+    let detail = client
+        .get_pr_detail(pr.number)
+        .await
+        .map_err(|err| format!("Failed to load PR: {err}"))?;
+    let analysis = ai::analyze_pr(
+        &detail,
+        &config.provider,
+        &config.model,
+        &config.base_url,
+        &config.api_key_env,
+        &config.cache,
+        &config.repo,
+        &config.prompt_version,
+    )
+    .await;
+    Ok(DetailLoadResult::Pr {
+        detail,
+        analysis,
+        status: "PR analysis loaded".to_string(),
+    })
+}
+
+async fn load_issue_detail(
+    client: GitHubClient,
+    config: AppConfig,
+    issue: IssueData,
+) -> std::result::Result<DetailLoadResult, String> {
+    let provider = resolved_provider(&config);
+    if let Some(cached) = cache::get_cached_issue_analysis(
+        &config.cache,
+        &config.repo,
+        issue.number,
+        &provider.provider,
+        &provider.model,
+        &config.prompt_version,
+        "issue-analysis-v1",
+    ) {
+        let detail = client
+            .get_issue_summary(issue.number)
+            .await
+            .map_err(|err| format!("Failed to load issue metadata: {err}"))?;
+        return Ok(DetailLoadResult::Issue {
+            detail,
+            analysis: ai::issue_analysis_from_value(&cached),
+            status: "Issue analysis loaded from cache".to_string(),
+        });
+    }
+    let detail = client
+        .get_issue_detail(issue.number)
+        .await
+        .map_err(|err| format!("Failed to load issue: {err}"))?;
+    let analysis = ai::analyze_issue(
+        &detail,
+        &config.provider,
+        &config.model,
+        &config.base_url,
+        &config.api_key_env,
+        &config.cache,
+        &config.repo,
+        &config.prompt_version,
+    )
+    .await;
+    Ok(DetailLoadResult::Issue {
+        detail,
+        analysis,
+        status: "Issue analysis loaded".to_string(),
+    })
 }
 
 async fn run_loop(
@@ -341,6 +443,7 @@ async fn run_loop(
     state: &mut State,
 ) -> Result<()> {
     loop {
+        state.complete_detail_load().await;
         terminal.draw(|frame| render(frame, state))?;
         if !event::poll(Duration::from_millis(200))? {
             continue;
@@ -419,7 +522,24 @@ async fn run_loop(
                     }
                     _ => {}
                 },
-                KeyCode::Enter => state.open_selected().await,
+                KeyCode::Enter => state.open_selected(),
+                _ => state.quit_armed = false,
+            },
+            Screen::Loading => match key.code {
+                KeyCode::Esc => {
+                    if let Some(task) = state.detail_task.take() {
+                        task.abort();
+                    }
+                    state.screen = Screen::List;
+                    state.status = "Load cancelled".to_string();
+                }
+                KeyCode::Char('q') => {
+                    if state.quit_armed {
+                        break;
+                    }
+                    state.quit_armed = true;
+                    state.status = "Press q again to quit".to_string();
+                }
                 _ => state.quit_armed = false,
             },
             Screen::Help | Screen::Info => match key.code {
@@ -431,6 +551,11 @@ async fn run_loop(
             Screen::PrDetail => match key.code {
                 KeyCode::Esc => state.screen = Screen::List,
                 KeyCode::Char('d') => state.screen = Screen::Diff,
+                KeyCode::Down => scroll_down(&mut state.pr_detail_scroll, 1),
+                KeyCode::Up => scroll_up(&mut state.pr_detail_scroll, 1),
+                KeyCode::PageDown => scroll_down(&mut state.pr_detail_scroll, 10),
+                KeyCode::PageUp => scroll_up(&mut state.pr_detail_scroll, 10),
+                KeyCode::Home => state.pr_detail_scroll = 0,
                 KeyCode::Char('c') => copy_text(
                     state
                         .pr_analysis
@@ -450,6 +575,11 @@ async fn run_loop(
             },
             Screen::IssueDetail => match key.code {
                 KeyCode::Esc => state.screen = Screen::List,
+                KeyCode::Down => scroll_down(&mut state.issue_detail_scroll, 1),
+                KeyCode::Up => scroll_up(&mut state.issue_detail_scroll, 1),
+                KeyCode::PageDown => scroll_down(&mut state.issue_detail_scroll, 10),
+                KeyCode::PageUp => scroll_up(&mut state.issue_detail_scroll, 10),
+                KeyCode::Home => state.issue_detail_scroll = 0,
                 KeyCode::Char('c') => copy_text(
                     state
                         .issue_analysis
@@ -469,6 +599,11 @@ async fn run_loop(
             },
             Screen::Diff => match key.code {
                 KeyCode::Esc => state.screen = Screen::PrDetail,
+                KeyCode::Down => scroll_down(&mut state.diff_scroll, 1),
+                KeyCode::Up => scroll_up(&mut state.diff_scroll, 1),
+                KeyCode::PageDown => scroll_down(&mut state.diff_scroll, 10),
+                KeyCode::PageUp => scroll_up(&mut state.diff_scroll, 10),
+                KeyCode::Home => state.diff_scroll = 0,
                 KeyCode::Char('q') => {
                     if state.quit_armed {
                         break;
@@ -513,7 +648,8 @@ fn render(frame: &mut Frame<'_>, state: &State) {
             .block(panel_block(" Views "))
             .highlight_style(
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ),
         chunks[1],
@@ -521,6 +657,7 @@ fn render(frame: &mut Frame<'_>, state: &State) {
 
     match state.screen {
         Screen::List => render_list(frame, state, chunks[2]),
+        Screen::Loading => render_loading(frame, state, chunks[2]),
         Screen::Help => render_help(frame, chunks[2]),
         Screen::Info => render_info(frame, state, chunks[2]),
         Screen::PrDetail => render_pr_detail(frame, state, chunks[2]),
@@ -598,17 +735,20 @@ fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
             ("q q", "quit"),
         ]),
         Screen::PrDetail => hint_spans(&[
+            ("Up/Down", "scroll"),
             ("d", "diff"),
             ("c", "copy review"),
             ("Esc", "back"),
             ("q q", "quit"),
         ]),
         Screen::IssueDetail => hint_spans(&[
+            ("Up/Down", "scroll"),
             ("c", "copy fix"),
             ("Esc", "back"),
             ("q q", "quit"),
         ]),
-        Screen::Diff => hint_spans(&[("Esc", "back"), ("q q", "quit")]),
+        Screen::Diff => hint_spans(&[("Up/Down", "scroll"), ("Esc", "back"), ("q q", "quit")]),
+        Screen::Loading => hint_spans(&[("Esc", "cancel"), ("q q", "quit")]),
         Screen::Help | Screen::Info => hint_spans(&[("Esc", "close")]),
     };
     let status = if is_busy_status(&state.status) {
@@ -751,6 +891,59 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect, title: &str, message: &
     );
 }
 
+fn render_loading(frame: &mut Frame<'_>, state: &State, area: Rect) {
+    let text = Text::from(vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            format!("{} {}", spinner(), state.status),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press Esc to cancel.",
+            Style::default().fg(TEXT_SECONDARY),
+        )),
+    ]);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(panel_block(" Loading "))
+            .alignment(Alignment::Center),
+        area,
+    );
+}
+
+fn render_scrollable_text(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    title: &str,
+    text: String,
+    scroll: u16,
+) {
+    let line_count = text.lines().count();
+    let viewport = area.height.saturating_sub(2) as usize;
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(Block::default().title(title).borders(Borders::ALL))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        area,
+    );
+    if line_count > viewport && area.height > 2 {
+        let mut state =
+            ScrollbarState::new(line_count.saturating_sub(viewport)).position(scroll as usize);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            }),
+            &mut state,
+        );
+    }
+}
+
 fn status_color(status: &str) -> Color {
     let lower = status.to_lowercase();
     if lower.contains("failed") || lower.contains("error") {
@@ -774,6 +967,14 @@ fn spinner() -> &'static str {
         .map(|d| (d.as_millis() / 100) as usize)
         .unwrap_or(0);
     FRAMES[tick % FRAMES.len()]
+}
+
+fn scroll_down(scroll: &mut u16, amount: u16) {
+    *scroll = scroll.saturating_add(amount);
+}
+
+fn scroll_up(scroll: &mut u16, amount: u16) {
+    *scroll = scroll.saturating_sub(amount);
 }
 
 fn relative_age(dt: &DateTime<Utc>) -> String {
@@ -971,12 +1172,7 @@ fn render_pr_detail(frame: &mut Frame<'_>, state: &State, area: ratatui::layout:
         analysis.semver_impact,
         analysis.review_comment,
     );
-    frame.render_widget(
-        Paragraph::new(text)
-            .block(Block::default().title(" PR Detail ").borders(Borders::ALL))
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    render_scrollable_text(frame, area, " PR Detail ", text, state.pr_detail_scroll);
 }
 
 fn render_issue_detail(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect) {
@@ -1008,15 +1204,12 @@ fn render_issue_detail(frame: &mut Frame<'_>, state: &State, area: ratatui::layo
         analysis.suspected_cause,
         analysis.suggested_fix,
     );
-    frame.render_widget(
-        Paragraph::new(text)
-            .block(
-                Block::default()
-                    .title(" Issue Detail ")
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: false }),
+    render_scrollable_text(
+        frame,
         area,
+        " Issue Detail ",
+        text,
+        state.issue_detail_scroll,
     );
 }
 
@@ -1032,20 +1225,11 @@ fn render_diff(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect
             }
         })
         .unwrap_or_else(|| "No PR loaded.".to_string());
-    frame.render_widget(
-        Paragraph::new(diff)
-            .block(
-                Block::default()
-                    .title(" Diff - Esc Back ")
-                    .borders(Borders::ALL),
-            )
-            .wrap(Wrap { trim: false }),
-        area,
-    );
+    render_scrollable_text(frame, area, " Diff - Esc Back ", diff, state.diff_scroll);
 }
 
 fn render_help(frame: &mut Frame<'_>, area: ratatui::layout::Rect) {
-    let text = "Up/Down   Navigate list items\nLeft/Right Change page\nEnter     Open selected item\nTab       Switch PRs/issues\nr         Refresh current view\ns         Toggle issue sort\ni         Runtime info\n?         Help\nc         Copy review/fix on detail screens\nd         View PR diff from PR detail\nEsc       Back/close\nq q       Quit";
+    let text = "Up/Down   Navigate list items or scroll detail text\nPgUp/PgDn Scroll detail text faster\nLeft/Right Change page\nEnter     Open selected item\nTab       Switch PRs/issues\nr         Refresh current view\ns         Toggle issue sort\ni         Runtime info\n?         Help\nc         Copy review/fix on detail screens\nd         View PR diff from PR detail\nEsc       Back/close\nq q       Quit";
     frame.render_widget(
         Paragraph::new(text).block(Block::default().title(" Help ").borders(Borders::ALL)),
         area,
