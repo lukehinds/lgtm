@@ -13,7 +13,7 @@ use clap::Parser;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "wftt",
+    name = "lgtm",
     version,
     about = "AI-powered TUI for reviewing GitHub pull requests and issues"
 )]
@@ -33,7 +33,7 @@ struct Cli {
     #[arg(long, help = "Environment variable that contains the provider API key")]
     api_key_env: Option<String>,
 
-    #[arg(long, value_name = "PATH", help = "Path to a gitnit.toml config file")]
+    #[arg(long, value_name = "PATH", help = "Path to a lgtm.toml config file")]
     config: Option<PathBuf>,
 
     #[arg(long, help = "Print resolved config values and exit")]
@@ -96,6 +96,14 @@ async fn main() -> Result<()> {
             config.github.poll_interval_seconds
         );
         println!("ui.columns = {}", config.ui.columns.join(", "));
+        println!("review.enabled = {}", config.review.enabled);
+        println!("review.repo_path = {}", config.review.repo_path);
+        println!("review.min_tool_calls = {}", config.review.min_tool_calls);
+        println!("review.max_tool_calls = {}", config.review.max_tool_calls);
+        println!(
+            "review.max_tool_output_bytes = {}",
+            config.review.max_tool_output_bytes
+        );
         return Ok(());
     }
 
@@ -126,6 +134,7 @@ async fn main() -> Result<()> {
             config_paths: config.loaded_paths,
             watch_paths: config.watch.paths,
             columns: config.ui.columns,
+            review: config.review,
         },
         client,
     )

@@ -37,7 +37,7 @@ use logic::{find_line_after, item_visible, offset_index};
 
 use crate::{
     ai, cache,
-    config::{CacheConfig, WatchedPathConfig},
+    config::{CacheConfig, ReviewConfig, WatchedPathConfig},
     github::GitHubClient,
     models::{
         IssueAnalysis, IssueData, IssueDetail, IssueLabel, IssueSeverity, PrAnalysis, PrData,
@@ -66,6 +66,7 @@ pub struct AppConfig {
     pub config_paths: Vec<PathBuf>,
     pub watch_paths: Vec<WatchedPathConfig>,
     pub columns: Vec<String>,
+    pub review: ReviewConfig,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +163,7 @@ struct State {
     issue_analysis: Option<IssueAnalysis>,
     detail_task: Option<JoinHandle<std::result::Result<DetailLoadResult, String>>>,
     detail_phase_rx: Option<UnboundedReceiver<String>>,
+    detail_activity: Vec<String>,
     list_task: Option<JoinHandle<std::result::Result<ListLoadResult, String>>>,
     load_error: Option<String>,
     pr_list_state: ListState,
@@ -225,6 +227,7 @@ impl State {
             issue_analysis: None,
             detail_task: None,
             detail_phase_rx: None,
+            detail_activity: Vec::new(),
             list_task: None,
             load_error: None,
             pr_list_state: ListState::default(),
@@ -421,6 +424,7 @@ impl State {
                 self.pr_detail = None;
                 self.pr_analysis = None;
                 self.load_error = None;
+                self.detail_activity.clear();
                 self.pr_detail_scroll = 0;
                 self.diff_scroll = 0;
                 self.diff_file_index = 0;
@@ -442,6 +446,7 @@ impl State {
                 self.issue_detail = None;
                 self.issue_analysis = None;
                 self.load_error = None;
+                self.detail_activity.clear();
                 self.issue_detail_scroll = 0;
                 let client = self.client.clone();
                 let config = self.config.clone();
@@ -458,8 +463,18 @@ impl State {
         let Some(rx) = self.detail_phase_rx.as_mut() else {
             return;
         };
-        while let Ok(status) = rx.try_recv() {
-            self.status = status;
+        while let Ok(message) = rx.try_recv() {
+            if let Some(status) = message.strip_prefix("status:") {
+                self.status = status.trim().to_string();
+            } else if let Some(event) = message.strip_prefix("log:") {
+                self.detail_activity.push(event.trim().to_string());
+                if self.detail_activity.len() > 16 {
+                    let overflow = self.detail_activity.len() - 16;
+                    self.detail_activity.drain(0..overflow);
+                }
+            } else {
+                self.status = message;
+            }
         }
     }
 
@@ -530,33 +545,55 @@ async fn load_pr_detail(
     };
     let provider = resolved_provider(&config);
     let _ = phase_tx.send(format!("Checking cached PR #{} analysis...", pr.number));
-    if let Some(cached) = cache::get_cached_pr_analysis(
-        &config.cache,
-        &config.repo,
-        pr.number,
-        &head_sha,
-        &provider.provider,
-        &provider.model,
-        &config.prompt_version,
-        "pr-analysis-v1",
-    ) {
-        let _ = phase_tx.send(format!("Loading PR #{} metadata...", pr.number));
-        let detail = client
-            .get_pr_summary(pr.number, false)
-            .await
-            .map_err(|err| format!("Failed to load PR metadata: {err}"))?;
-        return Ok(DetailLoadResult::Pr {
-            detail,
-            analysis: ai::pr_analysis_from_value(&cached),
-            status: "PR analysis loaded from cache".to_string(),
-        });
+    if !(config.review.enabled && config.review.max_tool_calls > 0) {
+        if let Some(cached) = cache::get_cached_pr_analysis(
+            &config.cache,
+            &config.repo,
+            pr.number,
+            &head_sha,
+            &provider.provider,
+            &provider.model,
+            &config.prompt_version,
+            "pr-analysis-v1",
+        ) {
+            let _ = phase_tx.send(format!("Loading PR #{} metadata...", pr.number));
+            let detail = client
+                .get_pr_summary(pr.number, false)
+                .await
+                .map_err(|err| format!("Failed to load PR metadata: {err}"))?;
+            return Ok(DetailLoadResult::Pr {
+                detail,
+                analysis: ai::pr_analysis_from_value(&cached),
+                status: "PR analysis loaded from cache".to_string(),
+            });
+        }
     }
     let _ = phase_tx.send(format!("Fetching PR #{} diff and metadata...", pr.number));
     let detail = client
         .get_pr_detail(pr.number)
         .await
         .map_err(|err| format!("Failed to load PR: {err}"))?;
-    let _ = phase_tx.send(format!("Analyzing PR #{}...", pr.number));
+    let mode = if config.review.enabled && config.review.max_tool_calls > 0 {
+        "with repo context"
+    } else {
+        "from diff"
+    };
+    let _ = phase_tx.send(format!("Analyzing PR #{} {mode}...", pr.number));
+    if config.review.enabled && config.review.max_tool_calls > 0 {
+        let _ = phase_tx.send(format!(
+            "log:Repo-context review enabled; tool budget {}",
+            config.review.max_tool_calls
+        ));
+        let _ = phase_tx.send(format!(
+            "log:Minimum repo tool calls required: {}",
+            config
+                .review
+                .min_tool_calls
+                .min(config.review.max_tool_calls)
+        ));
+    } else {
+        let _ = phase_tx.send("log:Diff-only review mode".to_string());
+    }
     let analysis = ai::analyze_pr(
         &detail,
         &config.provider,
@@ -566,6 +603,8 @@ async fn load_pr_detail(
         &config.cache,
         &config.repo,
         &config.prompt_version,
+        &config.review,
+        Some(phase_tx.clone()),
     )
     .await;
     Ok(DetailLoadResult::Pr {
@@ -1025,7 +1064,7 @@ fn render_header(frame: &mut Frame<'_>, state: &State, area: Rect) {
     let provider = resolved_provider(&state.config);
     let title = Line::from(vec![
         Span::styled(
-            " wftt ",
+            " lgtm ",
             Style::default()
                 .fg(Color::Black)
                 .bg(Color::Cyan)
@@ -1373,7 +1412,7 @@ fn render_empty_state(frame: &mut Frame<'_>, area: Rect, title: &str, message: &
 }
 
 fn render_loading(frame: &mut Frame<'_>, state: &State, area: Rect) {
-    let text = Text::from(vec![
+    let mut lines = vec![
         Line::from(""),
         Line::from(Span::styled(
             format!("{} {}", spinner(), state.status),
@@ -1381,18 +1420,51 @@ fn render_loading(frame: &mut Frame<'_>, state: &State, area: Rect) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         )),
+    ];
+    if !state.detail_activity.is_empty() {
+        lines.push(Line::from(""));
+        let available = area.height.saturating_sub(7) as usize;
+        let show = available.clamp(1, 10);
+        for event in state
+            .detail_activity
+            .iter()
+            .rev()
+            .take(show)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+        {
+            lines.push(Line::from(Span::styled(
+                truncate(event, area.width.saturating_sub(8) as usize),
+                Style::default().fg(TEXT_MUTED),
+            )));
+        }
+    }
+    if let Some(tool) = active_repo_tool(&state.status) {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("Repo tool: {tool}"),
+            Style::default().fg(TEXT_MUTED),
+        )));
+    }
+    lines.extend([
         Line::from(""),
         Line::from(Span::styled(
             "Press Esc to cancel.",
             Style::default().fg(TEXT_SECONDARY),
         )),
     ]);
+    let text = Text::from(lines);
     frame.render_widget(
         Paragraph::new(text)
             .block(panel_block(" Loading "))
             .alignment(Alignment::Center),
         area,
     );
+}
+
+fn active_repo_tool(status: &str) -> Option<&str> {
+    status.strip_prefix("Using repo tool: ").map(str::trim)
 }
 
 fn render_error(frame: &mut Frame<'_>, state: &State, area: Rect) {
