@@ -1,12 +1,12 @@
-# wftt Porting Status
+# lgtm Porting Status
 
-This repository is a Rust port of `gitnit`.
+This repository is a Rust port of `lgtm`.
 
 ## Implemented
 
 - CLI flags: `--repo`, `--provider`, `--model`, `--base-url`, `--api-key-env`, `--config`, `--show-config`.
 - Config loading precedence compatible with the Python app:
-  `~/.config/gitnit/gitnit.toml`, `./gitnit.toml`, `./.gitnit.toml`, then explicit `--config`.
+  `~/.config/lgtm/lgtm.toml`, `./lgtm.toml`, `./.lgtm.toml`, then explicit `--config`.
 - GitHub REST client using `GITHUB_TOKEN`.
 - PR list and issue list with paging, refresh, issue sort toggle, and cached list startup.
 - PR list loading from GitHub's lightweight pull-list endpoint, with detail-only count fields defaulted until PR detail is opened.

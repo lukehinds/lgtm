@@ -1,20 +1,27 @@
-use std::{env, future::Future, pin::Pin};
+use std::{
+    env, fs,
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
+};
 
 use anyhow::{Context, Result, bail};
 use regex::Regex;
 use reqwest::Client;
 use serde_json::{Value, json};
+use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
     cache,
-    config::CacheConfig,
+    config::{CacheConfig, ReviewConfig},
     models::{IssueAnalysis, IssueDetail, IssueSeverity, PrAnalysis, PrDetail},
 };
 
 const PR_SCHEMA_VERSION: &str = "pr-analysis-v1";
 const ISSUE_SCHEMA_VERSION: &str = "issue-analysis-v1";
+const AGENTIC_PR_SCHEMA_VERSION: &str = "pr-analysis-agentic-v3";
 
-const PR_ANALYSIS_PROMPT: &str = r#"You are GitNit, an expert code reviewer. Analyze the following pull request and provide your assessment.
+const PR_ANALYSIS_PROMPT: &str = r#"You are lgtm, an expert code reviewer. Analyze the following pull request and provide your assessment.
 
 ## Pull Request Information
 - **Title:** {title}
@@ -48,7 +55,7 @@ Respond with a JSON object containing exactly these fields (no markdown, just ra
 }}
 "#;
 
-const ISSUE_ANALYSIS_PROMPT: &str = r#"You are GitNit, an expert at triaging GitHub issues. Analyze the following issue and provide your assessment.
+const ISSUE_ANALYSIS_PROMPT: &str = r#"You are lgtm, an expert at triaging GitHub issues. Analyze the following issue and provide your assessment.
 
 ## Issue Information
 - **Title:** {title}
@@ -80,6 +87,18 @@ pub struct ProviderConfig {
     pub model: String,
     pub base_url: String,
     pub api_key_env: String,
+}
+
+struct ReviewToolContext<'a> {
+    root: PathBuf,
+    pr_detail: &'a PrDetail,
+    max_output_bytes: usize,
+}
+
+enum ReviewStep {
+    Tool { name: String, args: Value },
+    Final(PrAnalysis),
+    Invalid(String),
 }
 
 pub trait RestProvider {
@@ -304,8 +323,21 @@ pub async fn analyze_pr(
     cache_config: &CacheConfig,
     repo: &str,
     prompt_version: &str,
+    review_config: &ReviewConfig,
+    progress_tx: Option<UnboundedSender<String>>,
 ) -> PrAnalysis {
     let config = resolve_provider_config(provider, model, base_url, api_key_env);
+    let tool_context = review_tool_context(review_config, pr_detail);
+    let schema_version = if tool_context.is_some() {
+        AGENTIC_PR_SCHEMA_VERSION
+    } else {
+        PR_SCHEMA_VERSION
+    };
+    let cache_prompt_version = if tool_context.is_some() {
+        format!("{prompt_version}:repo-context")
+    } else {
+        prompt_version.to_string()
+    };
     if !repo.is_empty() && !pr_detail.pr.head_sha.is_empty() {
         if let Some(cached) = cache::get_cached_pr_analysis(
             cache_config,
@@ -314,15 +346,46 @@ pub async fn analyze_pr(
             &pr_detail.pr.head_sha,
             &config.provider,
             &config.model,
-            prompt_version,
-            PR_SCHEMA_VERSION,
+            &cache_prompt_version,
+            schema_version,
         ) {
             return pr_analysis_from_value(&cached);
         }
     }
 
+    let analysis = if let Some(tool_context) = tool_context {
+        analyze_pr_with_tools(
+            &config,
+            pr_detail,
+            &tool_context,
+            review_config.min_tool_calls,
+            review_config.max_tool_calls,
+            progress_tx,
+        )
+        .await
+    } else {
+        analyze_pr_diff_only(&config, pr_detail).await
+    };
+
+    if !repo.is_empty() && !pr_detail.pr.head_sha.is_empty() {
+        cache::save_pr_analysis(
+            cache_config,
+            repo,
+            pr_detail.pr.number,
+            &pr_detail.pr.head_sha,
+            &serde_json::to_value(&analysis).unwrap_or_else(|_| json!({})),
+            &config.provider,
+            &config.model,
+            &cache_prompt_version,
+            schema_version,
+        );
+    }
+    analysis
+}
+
+async fn analyze_pr_diff_only(config: &ProviderConfig, pr_detail: &PrDetail) -> PrAnalysis {
     let prompt = pr_prompt(pr_detail);
-    let analysis = match generate(&config, &prompt).await {
+    match generate(config, &prompt).await {
         Ok(text) => extract_json(&text).map_or_else(
             || PrAnalysis {
                 summary: if text.is_empty() {
@@ -347,22 +410,421 @@ pub async fn analyze_pr(
             ),
             ..PrAnalysis::default()
         },
-    };
-
-    if !repo.is_empty() && !pr_detail.pr.head_sha.is_empty() {
-        cache::save_pr_analysis(
-            cache_config,
-            repo,
-            pr_detail.pr.number,
-            &pr_detail.pr.head_sha,
-            &serde_json::to_value(&analysis).unwrap_or_else(|_| json!({})),
-            &config.provider,
-            &config.model,
-            prompt_version,
-            PR_SCHEMA_VERSION,
-        );
     }
-    analysis
+}
+
+async fn analyze_pr_with_tools(
+    config: &ProviderConfig,
+    pr_detail: &PrDetail,
+    tool_context: &ReviewToolContext<'_>,
+    min_tool_calls: usize,
+    max_tool_calls: usize,
+    progress_tx: Option<UnboundedSender<String>>,
+) -> PrAnalysis {
+    let mut transcript = String::new();
+    let min_tool_calls = min_tool_calls.min(max_tool_calls);
+    let mut tool_calls = 0usize;
+    for turn in 0..=max_tool_calls {
+        if let Some(progress_tx) = &progress_tx {
+            let status = if tool_calls >= min_tool_calls {
+                "Repo context: reviewing gathered context..."
+            } else {
+                "Repo context: gathering required context..."
+            };
+            let _ = progress_tx.send(format!("status:{status}"));
+            let _ = progress_tx.send(format!(
+                "log:Model turn {}: {} ({}/{})",
+                turn + 1,
+                if tool_calls > 0 {
+                    "reviewing tool results"
+                } else {
+                    "choosing first repo tool"
+                },
+                tool_calls,
+                min_tool_calls
+            ));
+        }
+        let prompt = agentic_pr_prompt(
+            pr_detail,
+            &transcript,
+            max_tool_calls - turn,
+            min_tool_calls,
+            tool_calls,
+        );
+        let text = match generate(config, &prompt).await {
+            Ok(text) => text,
+            Err(err) => {
+                return PrAnalysis {
+                    summary: format!("{} repo-context analysis failed: {err}", config.provider),
+                    review_comment: format!(
+                        "Unable to generate repo-context review with provider '{}'.",
+                        config.provider
+                    ),
+                    ..PrAnalysis::default()
+                };
+            }
+        };
+        match parse_review_step(&text) {
+            ReviewStep::Final(analysis) if tool_calls >= min_tool_calls || max_tool_calls == 0 => {
+                return analysis;
+            }
+            ReviewStep::Final(_) => {
+                if let Some(progress_tx) = &progress_tx {
+                    let _ = progress_tx.send(format!(
+                        "log:Model tried to finalize after {tool_calls}/{min_tool_calls} tool calls; requesting more context"
+                    ));
+                }
+                transcript.push_str(&format!(
+                    "\n\nYou returned final review JSON after {tool_calls} tool calls, but this review requires at least {min_tool_calls}. \
+Request another read-only repo tool now, then produce the final review after enough context has been gathered.\n",
+                ));
+            }
+            ReviewStep::Tool { name, args } if turn < max_tool_calls => {
+                if let Some(progress_tx) = &progress_tx {
+                    let summary = format!("{}{}", name, tool_arg_summary(&name, &args));
+                    let _ = progress_tx.send(format!("status:Using repo tool: {summary}"));
+                    let _ = progress_tx.send(format!("log:Tool requested: {summary}"));
+                }
+                let result = run_review_tool(tool_context, &name, &args);
+                if let Some(progress_tx) = &progress_tx {
+                    let _ = progress_tx.send(format!(
+                        "log:Tool completed: {} ({} bytes)",
+                        name,
+                        result.len()
+                    ));
+                }
+                tool_calls += 1;
+                transcript.push_str(&format!(
+                    "\n\nAssistant requested tool `{name}` with args:\n{}\n\nTool result:\n{}\n",
+                    compact_json(&args),
+                    result
+                ));
+            }
+            ReviewStep::Tool { .. } => {
+                transcript.push_str("\n\nTool budget exhausted. Provide final review JSON now.\n");
+            }
+            ReviewStep::Invalid(raw) => {
+                return PrAnalysis {
+                    summary: "Repo-context analysis did not return valid review JSON.".to_string(),
+                    review_comment: raw.chars().take(2_000).collect(),
+                    ..PrAnalysis::default()
+                };
+            }
+        }
+    }
+    PrAnalysis {
+        summary: "Repo-context analysis exhausted its tool budget before finalizing.".to_string(),
+        review_comment: "No final review was generated.".to_string(),
+        ..PrAnalysis::default()
+    }
+}
+
+fn review_tool_context<'a>(
+    config: &ReviewConfig,
+    pr_detail: &'a PrDetail,
+) -> Option<ReviewToolContext<'a>> {
+    if !config.enabled || config.max_tool_calls == 0 {
+        return None;
+    }
+    let root = PathBuf::from(&config.repo_path).canonicalize().ok()?;
+    root.is_dir().then_some(ReviewToolContext {
+        root,
+        pr_detail,
+        max_output_bytes: config.max_tool_output_bytes.max(1_000),
+    })
+}
+
+fn parse_review_step(text: &str) -> ReviewStep {
+    let Some(data) = extract_json(text) else {
+        return ReviewStep::Invalid(text.to_string());
+    };
+    if let Some(tool) = data.get("tool").and_then(Value::as_str) {
+        return ReviewStep::Tool {
+            name: tool.to_string(),
+            args: data.get("args").cloned().unwrap_or_else(|| json!({})),
+        };
+    }
+    if let Some(request) = data.get("tool_request").and_then(Value::as_object) {
+        if let Some(tool) = request.get("tool").and_then(Value::as_str) {
+            return ReviewStep::Tool {
+                name: tool.to_string(),
+                args: request.get("args").cloned().unwrap_or_else(|| json!({})),
+            };
+        }
+    }
+    ReviewStep::Final(pr_analysis_from_value(&data))
+}
+
+fn run_review_tool(context: &ReviewToolContext<'_>, name: &str, args: &Value) -> String {
+    let result = match name {
+        "changed_files" => tool_changed_files(context),
+        "diff_for_file" => {
+            let path = string_arg(args, "path");
+            tool_diff_for_file(context, &path)
+        }
+        "list_dir" => {
+            let path = string_arg_or(args, "path", ".");
+            tool_list_dir(context, &path)
+        }
+        "read_file" => {
+            let path = string_arg(args, "path");
+            let start = usize_arg_or(args, "start", 1);
+            let lines = usize_arg_or(args, "lines", 120).min(300);
+            tool_read_file(context, &path, start, lines)
+        }
+        "grep" => {
+            let pattern = string_arg(args, "pattern");
+            let path = string_arg_or(args, "path", ".");
+            tool_grep(context, &pattern, &path)
+        }
+        _ => format!("Unknown tool `{name}`."),
+    };
+    truncate_bytes(&result, context.max_output_bytes)
+}
+
+fn tool_arg_summary(name: &str, args: &Value) -> String {
+    match name {
+        "read_file" | "diff_for_file" | "list_dir" => {
+            let path = string_arg(args, "path");
+            if path.is_empty() {
+                String::new()
+            } else {
+                format!(" {path}")
+            }
+        }
+        "grep" => {
+            let pattern = string_arg(args, "pattern");
+            let path = string_arg_or(args, "path", ".");
+            if pattern.is_empty() {
+                format!(" {path}")
+            } else {
+                format!(" {pattern} in {path}")
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn tool_changed_files(context: &ReviewToolContext<'_>) -> String {
+    context
+        .pr_detail
+        .files
+        .iter()
+        .map(|file| format!("- {file}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn tool_diff_for_file(context: &ReviewToolContext<'_>, path: &str) -> String {
+    if path.trim().is_empty() {
+        return "Missing path.".to_string();
+    }
+    let mut out = Vec::new();
+    let mut capture = false;
+    for line in context.pr_detail.diff.lines() {
+        if let Some(header) = line.strip_prefix("--- ") {
+            capture = header.trim() == path.trim();
+        }
+        if line.starts_with("diff --git ") {
+            capture = line.contains(path.trim());
+        }
+        if capture {
+            out.push(line.to_string());
+        }
+    }
+    if out.is_empty() {
+        format!("No diff found for `{path}`.")
+    } else {
+        out.join("\n")
+    }
+}
+
+fn tool_list_dir(context: &ReviewToolContext<'_>, path: &str) -> String {
+    let Ok(path) = safe_path(&context.root, path) else {
+        return "Path is outside repo or does not exist.".to_string();
+    };
+    let Ok(entries) = fs::read_dir(&path) else {
+        return format!(
+            "Could not list `{}`.",
+            display_repo_path(&context.root, &path)
+        );
+    };
+    let mut rows = Vec::new();
+    for entry in entries.flatten().take(200) {
+        let file_type = entry.file_type().ok();
+        let kind = if file_type.as_ref().is_some_and(|t| t.is_dir()) {
+            "dir "
+        } else {
+            "file"
+        };
+        rows.push(format!("{kind} {}", entry.file_name().to_string_lossy()));
+    }
+    rows.sort();
+    rows.join("\n")
+}
+
+fn tool_read_file(
+    context: &ReviewToolContext<'_>,
+    path: &str,
+    start: usize,
+    lines: usize,
+) -> String {
+    let Ok(path) = safe_path(&context.root, path) else {
+        return "Path is outside repo or does not exist.".to_string();
+    };
+    let Ok(content) = fs::read_to_string(&path) else {
+        return format!(
+            "Could not read `{}` as UTF-8.",
+            display_repo_path(&context.root, &path)
+        );
+    };
+    let start = start.max(1);
+    let selected = content
+        .lines()
+        .enumerate()
+        .skip(start - 1)
+        .take(lines)
+        .map(|(index, line)| format!("{:>5} | {line}", index + 1))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!("{}\n{}", display_repo_path(&context.root, &path), selected)
+}
+
+fn tool_grep(context: &ReviewToolContext<'_>, pattern: &str, path: &str) -> String {
+    if pattern.trim().is_empty() {
+        return "Missing pattern.".to_string();
+    }
+    let Ok(path) = safe_path(&context.root, path) else {
+        return "Path is outside repo or does not exist.".to_string();
+    };
+    let regex = Regex::new(pattern).ok();
+    let mut matches = Vec::new();
+    grep_path(
+        &context.root,
+        &path,
+        pattern,
+        regex.as_ref(),
+        &mut matches,
+        120,
+    );
+    if matches.is_empty() {
+        format!("No matches for `{pattern}`.")
+    } else {
+        matches.join("\n")
+    }
+}
+
+fn grep_path(
+    root: &Path,
+    path: &Path,
+    pattern: &str,
+    regex: Option<&Regex>,
+    matches: &mut Vec<String>,
+    max_matches: usize,
+) {
+    if matches.len() >= max_matches || ignored_path(path) {
+        return;
+    }
+    if path.is_dir() {
+        let Ok(entries) = fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            grep_path(root, &entry.path(), pattern, regex, matches, max_matches);
+            if matches.len() >= max_matches {
+                break;
+            }
+        }
+        return;
+    }
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    if metadata.len() > 1_000_000 {
+        return;
+    }
+    let Ok(content) = fs::read_to_string(path) else {
+        return;
+    };
+    for (index, line) in content.lines().enumerate() {
+        let matched = regex
+            .map(|regex| regex.is_match(line))
+            .unwrap_or_else(|| line.contains(pattern));
+        if matched {
+            matches.push(format!(
+                "{}:{}: {}",
+                display_repo_path(root, path),
+                index + 1,
+                line.trim_end()
+            ));
+            if matches.len() >= max_matches {
+                break;
+            }
+        }
+    }
+}
+
+fn safe_path(root: &Path, path: &str) -> std::result::Result<PathBuf, ()> {
+    let rel = path.trim();
+    let joined = if rel.is_empty() || rel == "." {
+        root.to_path_buf()
+    } else {
+        if Path::new(rel).is_absolute() {
+            return Err(());
+        }
+        root.join(rel)
+    };
+    let canonical = joined.canonicalize().map_err(|_| ())?;
+    canonical.starts_with(root).then_some(canonical).ok_or(())
+}
+
+fn ignored_path(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, ".git" | "target" | "node_modules" | ".next" | "dist"))
+}
+
+fn display_repo_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
+fn string_arg(args: &Value, key: &str) -> String {
+    args.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn string_arg_or(args: &Value, key: &str, default: &str) -> String {
+    args.get(key)
+        .and_then(Value::as_str)
+        .unwrap_or(default)
+        .to_string()
+}
+
+fn usize_arg_or(args: &Value, key: &str, default: usize) -> usize {
+    args.get(key)
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(default)
+}
+
+fn truncate_bytes(value: &str, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value.to_string();
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated to {max_bytes} bytes]", &value[..end])
+}
+
+fn compact_json(value: &Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
 }
 
 pub async fn analyze_issue(
@@ -491,6 +953,92 @@ fn pr_prompt(pr_detail: &PrDetail) -> String {
         .replace("{diff}", diff)
 }
 
+fn agentic_pr_prompt(
+    pr_detail: &PrDetail,
+    transcript: &str,
+    remaining_tool_calls: usize,
+    min_tool_calls: usize,
+    completed_tool_calls: usize,
+) -> String {
+    let diff = if pr_detail.diff.len() > 15_000 {
+        &pr_detail.diff[..15_000]
+    } else {
+        &pr_detail.diff
+    };
+    let files = pr_detail
+        .files
+        .iter()
+        .map(|f| format!("- {f}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        r#"You are lgtm, an expert code reviewer with read-only repository tools.
+
+Review this pull request. You must use at least {min_tool_calls} read-only repository tool calls before producing the final review when tool calls remain.
+Use tools to inspect context needed to assess correctness, compatibility, call sites, tests, or surrounding code.
+
+Available tools. Return exactly one JSON object when requesting a tool:
+{{"tool":"changed_files","args":{{}}}}
+{{"tool":"diff_for_file","args":{{"path":"src/lib.rs"}}}}
+{{"tool":"list_dir","args":{{"path":"src"}}}}
+{{"tool":"read_file","args":{{"path":"src/lib.rs","start":1,"lines":120}}}}
+{{"tool":"grep","args":{{"pattern":"symbol_or_regex","path":"src"}}}}
+
+Do not request write, shell, network, or mutation tools.
+Completed required tool calls: {completed_tool_calls}/{min_tool_calls}. Tool calls remaining: {remaining_tool_calls}.
+If completed tool calls are below the required minimum and tool calls remain, your next response must be a tool request JSON object, not final review JSON.
+
+When ready, return exactly this final JSON object and no markdown:
+{{
+  "summary": "A brief 2-3 sentence summary of what this PR achieves, in plain language.",
+  "security_risks": "Assessment of any security implications. If none, say 'No significant security risks identified.'",
+  "code_quality": "Brief assessment of code quality, patterns, and maintainability.",
+  "risk_level": "One of: Low, Medium, High, Critical",
+  "disruption_assessment": "How likely is this PR to break existing functionality? Consider scope of changes, test coverage implied, and areas affected.",
+  "backwards_compatibility": "Does this PR break any APIs, configs, or user-facing behavior? Would it require a major semver bump?",
+  "semver_impact": "One of: patch, minor, major - based on backwards compatibility analysis.",
+  "review_comment": "Write a friendly, professional review comment as if you are the maintainer. Be approachable but technical. Address the author by their username. Start with acknowledgment of the work, then provide specific feedback, and end with next steps or approval suggestion. Do NOT use markdown headers. Use plain paragraphs."
+}}
+
+## Pull Request Information
+- Title: {title}
+- Author: {author}
+- PR #{number}
+- Files changed: {changed_files}
+- Lines added/deleted: +{additions} / -{deletions}
+
+## PR Description
+{body}
+
+## Changed Files
+{files}
+
+## Diff
+{diff}
+
+## Prior Tool Transcript
+{transcript}
+"#,
+        title = pr_detail.pr.title,
+        author = pr_detail.pr.author,
+        number = pr_detail.pr.number,
+        changed_files = pr_detail.pr.changed_files,
+        additions = pr_detail.pr.additions,
+        deletions = pr_detail.pr.deletions,
+        body = empty_as(&pr_detail.pr.body, "(no description)"),
+        files = files,
+        diff = diff,
+        transcript = if transcript.trim().is_empty() {
+            "(none)"
+        } else {
+            transcript
+        },
+        min_tool_calls = min_tool_calls,
+        completed_tool_calls = completed_tool_calls,
+        remaining_tool_calls = remaining_tool_calls,
+    )
+}
+
 fn issue_prompt(issue_detail: &IssueDetail) -> String {
     let comments = if issue_detail.comments.is_empty() {
         "(no comments)".to_string()
@@ -611,6 +1159,36 @@ mod tests {
     fn uses_comment_aliases() {
         let analysis = pr_analysis_from_value(&json!({"comment": "ship it"}));
         assert_eq!(analysis.review_comment, "ship it");
+    }
+
+    #[test]
+    fn parses_tool_request_step() {
+        match parse_review_step(r#"{"tool":"read_file","args":{"path":"src/lib.rs"}}"#) {
+            ReviewStep::Tool { name, args } => {
+                assert_eq!(name, "read_file");
+                assert_eq!(args["path"], "src/lib.rs");
+            }
+            _ => panic!("expected tool request"),
+        }
+    }
+
+    #[test]
+    fn parses_final_review_step() {
+        match parse_review_step(r#"{"summary":"ok","risk_level":"Low"}"#) {
+            ReviewStep::Final(analysis) => {
+                assert_eq!(analysis.summary, "ok");
+                assert_eq!(analysis.risk_level, "Low");
+            }
+            _ => panic!("expected final review"),
+        }
+    }
+
+    #[test]
+    fn truncates_tool_output_on_char_boundary() {
+        let value = "abcédef";
+        let truncated = truncate_bytes(value, 4);
+        assert!(truncated.starts_with("abc"));
+        assert!(truncated.contains("[truncated"));
     }
 
     #[test]

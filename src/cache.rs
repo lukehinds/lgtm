@@ -377,12 +377,12 @@ pub fn cache_dir(config: &CacheConfig) -> PathBuf {
 
 fn default_cache_dir() -> PathBuf {
     if let Some(xdg) = env::var_os("XDG_CACHE_HOME") {
-        PathBuf::from(xdg).join("gitnit")
+        PathBuf::from(xdg).join("lgtm")
     } else {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".cache")
-            .join("gitnit")
+            .join("lgtm")
     }
 }
 
@@ -538,7 +538,7 @@ mod tests {
 
     fn temp_cache_dir(name: &str) -> String {
         env::temp_dir()
-            .join(format!("wftt-cache-test-{}-{name}", std::process::id()))
+            .join(format!("lgtm-cache-test-{}-{name}", std::process::id()))
             .display()
             .to_string()
     }

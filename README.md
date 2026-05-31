@@ -1,8 +1,8 @@
-# wftt
+# lgtm
 
 A terminal UI for reviewing GitHub pull requests and issues, with AI-powered analysis.
 
-![wftt screenshot](docs/screenshot.png)
+![lgtm screenshot](docs/screenshot.png)
 
 ## Install
 
@@ -18,10 +18,10 @@ cargo install --path .
 ## Usage
 
 ```bash
-wftt --repo owner/repo
+lgtm --repo owner/repo
 ```
 
-Or set defaults in a config file (see below) and just run `wftt`.
+Or set defaults in a config file (see below) and just run `lgtm`.
 
 ## Keys
 
@@ -49,7 +49,7 @@ PRs are sorted by reviewability by default — passing CI, small diffs, and rece
 
 ## Config
 
-Create a `gitnit.toml` in your project or home directory:
+Create a `lgtm.toml` in your project or home directory:
 
 ```toml
 [github]
@@ -62,9 +62,22 @@ api_key_env = "GEMINI_API_KEY"
 
 [ui]
 columns = ["title", "author", "age", "label"]
+
+[review]
+enabled = true
+repo_path = "."
+min_tool_calls = 3
+max_tool_calls = 8
+max_tool_output_bytes = 12000
 ```
 
 Supported providers: `openai`, `gemini`, `anthropic`, or any OpenAI-compatible endpoint via `base_url`.
+
+PR analysis uses read-only repo-context tools by default when `review.enabled`
+is true. The model must request at least `min_tool_calls` bounded tool calls
+before producing the final review. Available tools are `read_file`, `list_dir`,
+`grep`, `changed_files`, and `diff_for_file`.
+Set `max_tool_calls = 0` or `enabled = false` for diff-only analysis.
 
 ## CLI flags
 

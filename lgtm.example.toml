@@ -19,7 +19,7 @@ poll_interval_seconds = 300
 
 [cache]
 enabled = true
-dir = "~/.cache/gitnit"
+dir = "~/.cache/lgtm"
 analysis_ttl_days = 30
 review_input_ttl_days = 14
 max_size_mb = 2048
@@ -27,6 +27,15 @@ max_size_mb = 2048
 [ui]
 # Available list columns: title, author, age, label, size
 columns = ["title", "author", "age", "label"]
+
+[review]
+# Enables read-only repo-context tools for PR analysis. Set max_tool_calls = 0
+# or enabled = false to use diff-only analysis.
+enabled = true
+repo_path = "."
+min_tool_calls = 3
+max_tool_calls = 8
+max_tool_output_bytes = 12000
 
 # Provider examples:
 #

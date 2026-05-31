@@ -33,7 +33,7 @@ impl GitHubClient {
             header::HeaderValue::from_static("2022-11-28"),
         );
         let client = Client::builder()
-            .user_agent("wftt/0.1.0")
+            .user_agent("lgtm/0.1.0")
             .default_headers(headers)
             .build()?;
         Ok(Self { client, repo })

@@ -62,7 +62,7 @@ impl Default for CacheConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            dir: "~/.cache/gitnit".to_string(),
+            dir: "~/.cache/lgtm".to_string(),
             analysis_ttl_days: 30,
             review_input_ttl_days: 14,
             max_size_mb: 2048,
@@ -115,17 +115,40 @@ impl Default for UiConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
-pub struct GitNitConfig {
+pub struct ReviewConfig {
+    pub enabled: bool,
+    pub repo_path: String,
+    pub min_tool_calls: usize,
+    pub max_tool_calls: usize,
+    pub max_tool_output_bytes: usize,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            repo_path: ".".to_string(),
+            min_tool_calls: 3,
+            max_tool_calls: 8,
+            max_tool_output_bytes: 12_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LgtmConfig {
     pub ai: AiConfig,
     pub github: GitHubConfig,
     pub cache: CacheConfig,
     pub watch: WatchConfig,
     pub ui: UiConfig,
+    pub review: ReviewConfig,
     #[serde(skip)]
     pub loaded_paths: Vec<PathBuf>,
 }
 
-impl Default for GitNitConfig {
+impl Default for LgtmConfig {
     fn default() -> Self {
         Self {
             ai: AiConfig::default(),
@@ -133,12 +156,13 @@ impl Default for GitNitConfig {
             cache: CacheConfig::default(),
             watch: WatchConfig::default(),
             ui: UiConfig::default(),
+            review: ReviewConfig::default(),
             loaded_paths: Vec::new(),
         }
     }
 }
 
-pub fn load_config(config_path: Option<&Path>, cwd: Option<&Path>) -> Result<GitNitConfig> {
+pub fn load_config(config_path: Option<&Path>, cwd: Option<&Path>) -> Result<LgtmConfig> {
     let cwd_buf;
     let cwd = match cwd {
         Some(path) => path,
@@ -164,7 +188,7 @@ pub fn load_config(config_path: Option<&Path>, cwd: Option<&Path>) -> Result<Git
     }
 
     normalize_legacy_top_level(&mut merged);
-    let mut config: GitNitConfig = merged.try_into().context("invalid config shape")?;
+    let mut config: LgtmConfig = merged.try_into().context("invalid config shape")?;
     config.loaded_paths = loaded_paths;
     config.watch.paths.retain(|p| !p.path.trim().is_empty());
     Ok(config)
@@ -173,20 +197,20 @@ pub fn load_config(config_path: Option<&Path>, cwd: Option<&Path>) -> Result<Git
 fn default_config_paths(cwd: &Path) -> Vec<PathBuf> {
     vec![
         user_config_path(),
-        cwd.join("gitnit.toml"),
-        cwd.join(".gitnit.toml"),
+        cwd.join("lgtm.toml"),
+        cwd.join(".lgtm.toml"),
     ]
 }
 
 fn user_config_path() -> PathBuf {
     if let Some(xdg) = env::var_os("XDG_CONFIG_HOME") {
-        PathBuf::from(xdg).join("gitnit").join("gitnit.toml")
+        PathBuf::from(xdg).join("lgtm").join("lgtm.toml")
     } else {
         dirs::home_dir()
             .unwrap_or_else(|| PathBuf::from("."))
             .join(".config")
-            .join("gitnit")
-            .join("gitnit.toml")
+            .join("lgtm")
+            .join("lgtm.toml")
     }
 }
 
@@ -256,7 +280,7 @@ mod tests {
     fn watched_paths_without_path_are_removed() {
         let dir = tempfile_path();
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("gitnit.toml");
+        let path = dir.join("lgtm.toml");
         fs::write(
             &path,
             r#"
@@ -274,13 +298,13 @@ mod tests {
     fn loads_cache_config() {
         let dir = tempfile_path().join("cache-config");
         fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("gitnit.toml");
+        let path = dir.join("lgtm.toml");
         fs::write(
             &path,
             r#"
             [cache]
             enabled = false
-            dir = "/tmp/wftt-cache-test"
+            dir = "/tmp/lgtm-cache-test"
             analysis_ttl_days = 7
             review_input_ttl_days = 3
             max_size_mb = 128
@@ -289,13 +313,13 @@ mod tests {
         .unwrap();
         let config = load_config(Some(&path), Some(&dir)).unwrap();
         assert!(!config.cache.enabled);
-        assert_eq!(config.cache.dir, "/tmp/wftt-cache-test");
+        assert_eq!(config.cache.dir, "/tmp/lgtm-cache-test");
         assert_eq!(config.cache.analysis_ttl_days, 7);
         assert_eq!(config.cache.review_input_ttl_days, 3);
         assert_eq!(config.cache.max_size_mb, 128);
     }
 
     fn tempfile_path() -> PathBuf {
-        env::temp_dir().join(format!("wftt-test-{}", std::process::id()))
+        env::temp_dir().join(format!("lgtm-test-{}", std::process::id()))
     }
 }
