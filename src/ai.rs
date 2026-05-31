@@ -464,6 +464,12 @@ async fn analyze_pr_with_tools(
                 };
             }
         };
+        if let Some(progress_tx) = &progress_tx {
+            let _ = progress_tx.send(format!(
+                "log:Model response: {}",
+                model_dialogue_excerpt(&text)
+            ));
+        }
         match parse_review_step(&text) {
             ReviewStep::Final(analysis) if tool_calls >= min_tool_calls || max_tool_calls == 0 => {
                 return analysis;
@@ -825,6 +831,25 @@ fn truncate_bytes(value: &str, max_bytes: usize) -> String {
 
 fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn model_dialogue_excerpt(text: &str) -> String {
+    const MAX_CHARS: usize = 240;
+    let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let normalized = if normalized.is_empty() {
+        "(empty)".to_string()
+    } else {
+        normalized
+    };
+    if normalized.chars().count() <= MAX_CHARS {
+        return normalized;
+    }
+    let mut excerpt = normalized
+        .chars()
+        .take(MAX_CHARS.saturating_sub(3))
+        .collect::<String>();
+    excerpt.push_str("...");
+    excerpt
 }
 
 pub async fn analyze_issue(
@@ -1189,6 +1214,21 @@ mod tests {
         let truncated = truncate_bytes(value, 4);
         assert!(truncated.starts_with("abc"));
         assert!(truncated.contains("[truncated"));
+    }
+
+    #[test]
+    fn formats_model_dialogue_excerpt() {
+        let excerpt = model_dialogue_excerpt(
+            " \n {\"tool\":\"read_file\",\n \"args\":{\"path\":\"src/lib.rs\"}} \n",
+        );
+        assert_eq!(
+            excerpt,
+            r#"{"tool":"read_file", "args":{"path":"src/lib.rs"}}"#
+        );
+
+        let long = model_dialogue_excerpt(&"a".repeat(300));
+        assert_eq!(long.chars().count(), 240);
+        assert!(long.ends_with("..."));
     }
 
     #[test]

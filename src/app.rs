@@ -468,8 +468,8 @@ impl State {
                 self.status = status.trim().to_string();
             } else if let Some(event) = message.strip_prefix("log:") {
                 self.detail_activity.push(event.trim().to_string());
-                if self.detail_activity.len() > 8 {
-                    let overflow = self.detail_activity.len() - 8;
+                if self.detail_activity.len() > 16 {
+                    let overflow = self.detail_activity.len() - 16;
                     self.detail_activity.drain(0..overflow);
                 }
             } else {
@@ -1424,7 +1424,7 @@ fn render_loading(frame: &mut Frame<'_>, state: &State, area: Rect) {
     if !state.detail_activity.is_empty() {
         lines.push(Line::from(""));
         let available = area.height.saturating_sub(7) as usize;
-        let show = available.clamp(1, 6);
+        let show = available.clamp(1, 10);
         for event in state
             .detail_activity
             .iter()
