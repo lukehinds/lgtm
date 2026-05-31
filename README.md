@@ -29,6 +29,7 @@ Or set defaults in a config file (see below) and just run `wftt`.
 |-----|--------|
 | `Enter` | Open PR / issue detail and run AI analysis |
 | `Tab` | Switch between Pull Requests and Issues |
+| `Left` / `Right` | Previous / next list page |
 | `r` | Refresh from GitHub |
 | `s` | Cycle sort mode |
 | `f` | Cycle cache filter (all / cached / uncached) |

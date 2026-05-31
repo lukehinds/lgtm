@@ -122,6 +122,21 @@ enum DetailLoadResult {
     },
 }
 
+enum ListLoadResult {
+    PullRequests {
+        page: usize,
+        prs: Vec<PrData>,
+        total: u64,
+        status: String,
+    },
+    Issues {
+        page: usize,
+        issues: Vec<IssueData>,
+        total: u64,
+        status: String,
+    },
+}
+
 struct State {
     config: AppConfig,
     client: GitHubClient,
@@ -147,6 +162,7 @@ struct State {
     issue_analysis: Option<IssueAnalysis>,
     detail_task: Option<JoinHandle<std::result::Result<DetailLoadResult, String>>>,
     detail_phase_rx: Option<UnboundedReceiver<String>>,
+    list_task: Option<JoinHandle<std::result::Result<ListLoadResult, String>>>,
     load_error: Option<String>,
     pr_list_state: ListState,
     issue_list_state: ListState,
@@ -209,6 +225,7 @@ impl State {
             issue_analysis: None,
             detail_task: None,
             detail_phase_rx: None,
+            list_task: None,
             load_error: None,
             pr_list_state: ListState::default(),
             issue_list_state: ListState::default(),
@@ -236,6 +253,73 @@ impl State {
             IssueSort::Newest => issues.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
             IssueSort::Oldest => issues.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
             IssueSort::Author => issues.sort_by(|a, b| a.author.cmp(&b.author)),
+        }
+    }
+
+    fn start_list_load(&mut self, tab: Tab, page: usize, force: bool) {
+        if self.list_task.is_some() {
+            self.status = "List load already in progress".to_string();
+            return;
+        }
+        let client = self.client.clone();
+        let config = self.config.clone();
+        let pr_sort = self.pr_sort;
+        let issue_sort = self.issue_sort;
+        match tab {
+            Tab::PullRequests => {
+                self.status = format!("Fetching pull requests page {}...", page + 1);
+                self.list_task = Some(tokio::spawn(async move {
+                    load_pr_list(client, config, page, force, pr_sort).await
+                }));
+            }
+            Tab::Issues => {
+                self.status = format!("Fetching issues page {}...", page + 1);
+                self.list_task = Some(tokio::spawn(async move {
+                    load_issue_list(client, config, page, force, issue_sort).await
+                }));
+            }
+        }
+    }
+
+    async fn complete_list_load(&mut self) {
+        let Some(task) = self.list_task.as_ref() else {
+            return;
+        };
+        if !task.is_finished() {
+            return;
+        }
+        let Some(task) = self.list_task.take() else {
+            return;
+        };
+        match task.await {
+            Ok(Ok(ListLoadResult::PullRequests {
+                page,
+                prs,
+                total,
+                status,
+            })) => {
+                self.pr_page = page;
+                self.prs = prs;
+                self.pr_total = total;
+                self.selected_pr = self.selected_pr.min(self.prs.len().saturating_sub(1));
+                *self.pr_list_state.offset_mut() = 0;
+                self.status = status;
+            }
+            Ok(Ok(ListLoadResult::Issues {
+                page,
+                issues,
+                total,
+                status,
+            })) => {
+                self.issue_page = page;
+                self.issues = issues;
+                self.issue_total = total;
+                self.selected_issue = self.selected_issue.min(self.issues.len().saturating_sub(1));
+                *self.issue_list_state.offset_mut() = 0;
+                self.status = status;
+            }
+            Ok(Err(err)) => self.status = err,
+            Err(err) => self.status = format!("List load failed: {err}"),
         }
     }
 
@@ -546,12 +630,111 @@ async fn load_issue_detail(
     })
 }
 
+async fn load_pr_list(
+    client: GitHubClient,
+    config: AppConfig,
+    page: usize,
+    force: bool,
+    sort: PrSort,
+) -> std::result::Result<ListLoadResult, String> {
+    if !force {
+        if let Some((mut prs, total)) = cache::get_cached_pr_list(
+            &config.cache,
+            &config.repo,
+            page,
+            Some(Duration::from_secs(config.cache_ttl_seconds)),
+        ) {
+            apply_pr_sort(sort, &mut prs);
+            return Ok(ListLoadResult::PullRequests {
+                page,
+                prs,
+                total,
+                status: "Pull requests loaded from cache".to_string(),
+            });
+        }
+    }
+    let (mut prs, total) = client
+        .list_prs(page, 15, !config.watch_paths.is_empty())
+        .await
+        .map_err(|err| format!("Failed to load PRs: {err}"))?;
+    cache::save_pr_list(&config.cache, &config.repo, page, &prs, total);
+    apply_pr_sort(sort, &mut prs);
+    Ok(ListLoadResult::PullRequests {
+        page,
+        prs,
+        total,
+        status: "Pull requests loaded".to_string(),
+    })
+}
+
+async fn load_issue_list(
+    client: GitHubClient,
+    config: AppConfig,
+    page: usize,
+    force: bool,
+    sort: IssueSort,
+) -> std::result::Result<ListLoadResult, String> {
+    let direction = if sort == IssueSort::Oldest {
+        "asc"
+    } else {
+        "desc"
+    };
+    if !force {
+        if let Some((mut issues, total)) = cache::get_cached_issue_list(
+            &config.cache,
+            &config.repo,
+            page,
+            direction,
+            Some(Duration::from_secs(config.cache_ttl_seconds)),
+        ) {
+            apply_issue_sort(sort, &mut issues);
+            return Ok(ListLoadResult::Issues {
+                page,
+                issues,
+                total,
+                status: "Issues loaded from cache".to_string(),
+            });
+        }
+    }
+    let (mut issues, total) = client
+        .list_issues(page, 15, direction)
+        .await
+        .map_err(|err| format!("Failed to load issues: {err}"))?;
+    cache::save_issue_list(&config.cache, &config.repo, page, &issues, total, direction);
+    apply_issue_sort(sort, &mut issues);
+    Ok(ListLoadResult::Issues {
+        page,
+        issues,
+        total,
+        status: "Issues loaded".to_string(),
+    })
+}
+
+fn apply_pr_sort(sort: PrSort, prs: &mut Vec<PrData>) {
+    match sort {
+        PrSort::Smart => sorting::sort_prs(prs),
+        PrSort::Newest => prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at)),
+        PrSort::Oldest => prs.sort_by(|a, b| a.updated_at.cmp(&b.updated_at)),
+        PrSort::Smallest => prs.sort_by_key(PrData::lines_changed),
+        PrSort::Largest => prs.sort_by_key(|pr| std::cmp::Reverse(pr.lines_changed())),
+    }
+}
+
+fn apply_issue_sort(sort: IssueSort, issues: &mut Vec<IssueData>) {
+    match sort {
+        IssueSort::Newest => issues.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
+        IssueSort::Oldest => issues.sort_by(|a, b| a.created_at.cmp(&b.created_at)),
+        IssueSort::Author => issues.sort_by(|a, b| a.author.cmp(&b.author)),
+    }
+}
+
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     state: &mut State,
 ) -> Result<()> {
     loop {
         state.complete_detail_load().await;
+        state.complete_list_load().await;
         terminal.draw(|frame| render(frame, state))?;
         if !event::poll(Duration::from_millis(200))? {
             continue;
@@ -608,10 +791,12 @@ async fn run_loop(
                     };
                     state.quit_armed = false;
                 }
-                KeyCode::Char('s') => cycle_sort(state).await,
+                KeyCode::Char('s') => cycle_sort(state),
                 KeyCode::Char('r') => match state.tab {
-                    Tab::PullRequests => state.load_prs(true).await,
-                    Tab::Issues => state.load_issues(true).await,
+                    Tab::PullRequests => {
+                        state.start_list_load(Tab::PullRequests, state.pr_page, true)
+                    }
+                    Tab::Issues => state.start_list_load(Tab::Issues, state.issue_page, true),
                 },
                 KeyCode::Down => match state.tab {
                     Tab::PullRequests => move_list_selection(state, 1),
@@ -623,31 +808,27 @@ async fn run_loop(
                 },
                 KeyCode::Right => match state.tab {
                     Tab::PullRequests if ((state.pr_page + 1) * 15) < state.pr_total as usize => {
-                        state.pr_page += 1;
                         state.selected_pr = 0;
                         *state.pr_list_state.offset_mut() = 0;
-                        state.load_prs(false).await;
+                        state.start_list_load(Tab::PullRequests, state.pr_page + 1, false);
                     }
                     Tab::Issues if ((state.issue_page + 1) * 15) < state.issue_total as usize => {
-                        state.issue_page += 1;
                         state.selected_issue = 0;
                         *state.issue_list_state.offset_mut() = 0;
-                        state.load_issues(false).await;
+                        state.start_list_load(Tab::Issues, state.issue_page + 1, false);
                     }
                     _ => {}
                 },
                 KeyCode::Left => match state.tab {
                     Tab::PullRequests if state.pr_page > 0 => {
-                        state.pr_page -= 1;
                         state.selected_pr = 0;
                         *state.pr_list_state.offset_mut() = 0;
-                        state.load_prs(false).await;
+                        state.start_list_load(Tab::PullRequests, state.pr_page - 1, false);
                     }
                     Tab::Issues if state.issue_page > 0 => {
-                        state.issue_page -= 1;
                         state.selected_issue = 0;
                         *state.issue_list_state.offset_mut() = 0;
-                        state.load_issues(false).await;
+                        state.start_list_load(Tab::Issues, state.issue_page - 1, false);
                     }
                     _ => {}
                 },
@@ -892,6 +1073,7 @@ fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
         Screen::List if state.tab == Tab::PullRequests => hint_spans(&[
             ("Enter", "open"),
             ("Tab", "switch"),
+            ("Left/Right", "page"),
             ("r", "refresh"),
             ("s", "sort"),
             ("f", "filter"),
@@ -905,6 +1087,7 @@ fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
         Screen::List => hint_spans(&[
             ("Enter", "open"),
             ("Tab", "switch"),
+            ("Left/Right", "page"),
             ("r", "refresh"),
             ("s", "newest/oldest"),
             ("f", "filter"),
@@ -942,7 +1125,7 @@ fn render_footer(frame: &mut Frame<'_>, state: &State, area: Rect) {
         Screen::Error => hint_spans(&[("r", "retry"), ("Esc", "back"), ("q q", "quit")]),
         Screen::Help | Screen::Info => hint_spans(&[("Esc", "close")]),
     };
-    let status = if is_busy_status(&state.status) {
+    let status = if is_busy_status(&state.status) || state.list_task.is_some() {
         format!("{} {}", spinner(), state.status)
     } else {
         state.status.clone()
@@ -1287,7 +1470,10 @@ fn status_color(status: &str) -> Color {
 
 fn is_busy_status(status: &str) -> bool {
     let lower = status.to_lowercase();
-    lower.contains("loading") || lower.contains("fetching") || lower.contains("connecting")
+    lower.contains("loading")
+        || lower.contains("fetching")
+        || lower.contains("connecting")
+        || lower.contains("in progress")
 }
 
 fn spinner() -> &'static str {
@@ -1359,7 +1545,7 @@ fn cycle_cache_filter(state: &mut State) {
     state.status = format!("Filter: {}", filter_label(state.cache_filter));
 }
 
-async fn cycle_sort(state: &mut State) {
+fn cycle_sort(state: &mut State) {
     match state.tab {
         Tab::PullRequests => {
             state.pr_sort = match state.pr_sort {
@@ -1380,9 +1566,8 @@ async fn cycle_sort(state: &mut State) {
                 IssueSort::Oldest => IssueSort::Author,
                 IssueSort::Author => IssueSort::Newest,
             };
-            state.issue_page = 0;
-            state.load_issues(true).await;
             state.status = format!("Issue sort: {}", issue_sort_label(state.issue_sort));
+            state.start_list_load(Tab::Issues, 0, true);
         }
     }
 }
