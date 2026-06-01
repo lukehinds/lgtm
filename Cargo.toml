@@ -6,7 +6,7 @@ edition = "2024"
 readme = "README.md"
 license = "Apache-2.0"
 repository = "https://github.com/lukehinds/lgtm"
-keywords = ["code review", "ai"]
+keywords = ["code-review", "ai"]
 categories = ["command-line-utilities", "development-tools"]
 
 [package.metadata.deb]

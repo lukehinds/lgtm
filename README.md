@@ -92,6 +92,20 @@ load those instructions from a file relative to the working directory. If both
 are set, lgtm combines them.
 Set `max_tool_calls = 0` or `enabled = false` for diff-only analysis.
 
+### Repository-specific review instructions
+
+Use `review.system_prompt` for short inline instructions, or
+`review.system_prompt_file` to load longer instructions from a file:
+
+```toml
+[review]
+system_prompt_file = ".lgtm-review.md"
+```
+
+Relative prompt-file paths resolve from the working directory. If both
+`system_prompt` and `system_prompt_file` are set, lgtm combines them with the
+inline prompt first. Changing either value changes the analysis cache key.
+
 ## CLI flags
 
 ```
