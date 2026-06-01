@@ -1,7 +1,15 @@
 [package]
 name = "lgtm"
+description = "AI Code Review / Issue Triage Assistant"
 version = "0.1.0"
 edition = "2024"
+readme = "README.md"
+keywords = ["code review", "ai"]
+categories = ["command-line-utilities", "development-tools"]
+
+[package.metadata.deb]
+maintainer = "Luke Hinds"
+copyright = "2026, Luke Hinds"
 
 [dependencies]
 anyhow = "1.0"
