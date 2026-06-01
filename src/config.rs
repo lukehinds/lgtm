@@ -118,6 +118,8 @@ impl Default for UiConfig {
 pub struct ReviewConfig {
     pub enabled: bool,
     pub repo_path: String,
+    pub system_prompt: String,
+    pub system_prompt_file: String,
     pub min_tool_calls: usize,
     pub max_tool_calls: usize,
     pub max_tool_output_bytes: usize,
@@ -128,6 +130,8 @@ impl Default for ReviewConfig {
         Self {
             enabled: true,
             repo_path: ".".to_string(),
+            system_prompt: String::new(),
+            system_prompt_file: String::new(),
             min_tool_calls: 3,
             max_tool_calls: 8,
             max_tool_output_bytes: 12_000,
@@ -191,7 +195,37 @@ pub fn load_config(config_path: Option<&Path>, cwd: Option<&Path>) -> Result<Lgt
     let mut config: LgtmConfig = merged.try_into().context("invalid config shape")?;
     config.loaded_paths = loaded_paths;
     config.watch.paths.retain(|p| !p.path.trim().is_empty());
+    load_review_system_prompt_file(&mut config, cwd)?;
     Ok(config)
+}
+
+fn load_review_system_prompt_file(config: &mut LgtmConfig, cwd: &Path) -> Result<()> {
+    let prompt_file = config.review.system_prompt_file.trim();
+    if prompt_file.is_empty() {
+        return Ok(());
+    }
+    let path = PathBuf::from(prompt_file);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    };
+    let file_prompt = fs::read_to_string(&path).with_context(|| {
+        format!(
+            "unable to read review.system_prompt_file {}",
+            path.display()
+        )
+    })?;
+    if config.review.system_prompt.trim().is_empty() {
+        config.review.system_prompt = file_prompt;
+    } else if !file_prompt.trim().is_empty() {
+        config.review.system_prompt = format!(
+            "{}\n\n{}",
+            config.review.system_prompt.trim_end(),
+            file_prompt.trim_start()
+        );
+    }
+    Ok(())
 }
 
 fn default_config_paths(cwd: &Path) -> Vec<PathBuf> {
@@ -317,6 +351,67 @@ mod tests {
         assert_eq!(config.cache.analysis_ttl_days, 7);
         assert_eq!(config.cache.review_input_ttl_days, 3);
         assert_eq!(config.cache.max_size_mb, 128);
+    }
+
+    #[test]
+    fn loads_review_system_prompt() {
+        let dir = tempfile_path().join("review-system-prompt");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("lgtm.toml");
+        fs::write(
+            &path,
+            r#"
+            [review]
+            system_prompt = "Focus on auth boundaries."
+            "#,
+        )
+        .unwrap();
+        let config = load_config(Some(&path), Some(&dir)).unwrap();
+        assert_eq!(config.review.system_prompt, "Focus on auth boundaries.");
+    }
+
+    #[test]
+    fn loads_review_system_prompt_file() {
+        let dir = tempfile_path().join("review-system-prompt-file");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("review.md"), "Focus on sandbox boundaries.\n").unwrap();
+        let path = dir.join("lgtm.toml");
+        fs::write(
+            &path,
+            r#"
+            [review]
+            system_prompt_file = "review.md"
+            "#,
+        )
+        .unwrap();
+        let config = load_config(Some(&path), Some(&dir)).unwrap();
+        assert_eq!(
+            config.review.system_prompt,
+            "Focus on sandbox boundaries.\n"
+        );
+        assert_eq!(config.review.system_prompt_file, "review.md");
+    }
+
+    #[test]
+    fn combines_inline_and_file_system_prompts() {
+        let dir = tempfile_path().join("combined-review-system-prompt");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("review.md"), "Then focus on compatibility.\n").unwrap();
+        let path = dir.join("lgtm.toml");
+        fs::write(
+            &path,
+            r#"
+            [review]
+            system_prompt = "First focus on auth."
+            system_prompt_file = "review.md"
+            "#,
+        )
+        .unwrap();
+        let config = load_config(Some(&path), Some(&dir)).unwrap();
+        assert_eq!(
+            config.review.system_prompt,
+            "First focus on auth.\n\nThen focus on compatibility.\n"
+        );
     }
 
     fn tempfile_path() -> PathBuf {
