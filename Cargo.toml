@@ -4,6 +4,8 @@ description = "AI Code Review / Issue Triage Assistant"
 version = "0.1.0"
 edition = "2024"
 readme = "README.md"
+license = "Apache-2.0"
+repository = "https://github.com/lukehinds/lgtm"
 keywords = ["code review", "ai"]
 categories = ["command-line-utilities", "development-tools"]
 
