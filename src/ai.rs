@@ -9,6 +9,7 @@ use anyhow::{Context, Result, bail};
 use regex::Regex;
 use reqwest::Client;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::{
@@ -19,7 +20,7 @@ use crate::{
 
 const PR_SCHEMA_VERSION: &str = "pr-analysis-v1";
 const ISSUE_SCHEMA_VERSION: &str = "issue-analysis-v1";
-const AGENTIC_PR_SCHEMA_VERSION: &str = "pr-analysis-agentic-v3";
+pub const AGENTIC_PR_SCHEMA_VERSION: &str = "pr-analysis-agentic-v4";
 
 const PR_ANALYSIS_PROMPT: &str = r#"You are lgtm, an expert code reviewer. Analyze the following pull request and provide your assessment.
 
@@ -333,11 +334,8 @@ pub async fn analyze_pr(
     } else {
         PR_SCHEMA_VERSION
     };
-    let cache_prompt_version = if tool_context.is_some() {
-        format!("{prompt_version}:repo-context")
-    } else {
-        prompt_version.to_string()
-    };
+    let cache_prompt_version =
+        pr_cache_prompt_version(prompt_version, review_config, tool_context.is_some());
     if !repo.is_empty() && !pr_detail.pr.head_sha.is_empty() {
         if let Some(cached) = cache::get_cached_pr_analysis(
             cache_config,
@@ -360,11 +358,12 @@ pub async fn analyze_pr(
             &tool_context,
             review_config.min_tool_calls,
             review_config.max_tool_calls,
+            &review_config.system_prompt,
             progress_tx,
         )
         .await
     } else {
-        analyze_pr_diff_only(&config, pr_detail).await
+        analyze_pr_diff_only(&config, pr_detail, &review_config.system_prompt).await
     };
 
     if !repo.is_empty() && !pr_detail.pr.head_sha.is_empty() {
@@ -383,8 +382,36 @@ pub async fn analyze_pr(
     analysis
 }
 
-async fn analyze_pr_diff_only(config: &ProviderConfig, pr_detail: &PrDetail) -> PrAnalysis {
-    let prompt = pr_prompt(pr_detail);
+pub fn pr_cache_prompt_version(
+    prompt_version: &str,
+    review_config: &ReviewConfig,
+    repo_context: bool,
+) -> String {
+    let prompt_version = analysis_prompt_version(prompt_version, review_config);
+    if repo_context {
+        format!("{prompt_version}:repo-context")
+    } else {
+        prompt_version
+    }
+}
+
+pub fn analysis_prompt_version(prompt_version: &str, review_config: &ReviewConfig) -> String {
+    let system_prompt = review_config.system_prompt.trim();
+    if system_prompt.is_empty() {
+        return prompt_version.to_string();
+    }
+    format!(
+        "{prompt_version}:system-prompt-{}",
+        short_hash(system_prompt)
+    )
+}
+
+async fn analyze_pr_diff_only(
+    config: &ProviderConfig,
+    pr_detail: &PrDetail,
+    system_prompt: &str,
+) -> PrAnalysis {
+    let prompt = pr_prompt(pr_detail, system_prompt);
     match generate(config, &prompt).await {
         Ok(text) => extract_json(&text).map_or_else(
             || PrAnalysis {
@@ -419,6 +446,7 @@ async fn analyze_pr_with_tools(
     tool_context: &ReviewToolContext<'_>,
     min_tool_calls: usize,
     max_tool_calls: usize,
+    system_prompt: &str,
     progress_tx: Option<UnboundedSender<String>>,
 ) -> PrAnalysis {
     let mut transcript = String::new();
@@ -450,6 +478,7 @@ async fn analyze_pr_with_tools(
             max_tool_calls - turn,
             min_tool_calls,
             tool_calls,
+            system_prompt,
         );
         let text = match generate(config, &prompt).await {
             Ok(text) => text,
@@ -833,6 +862,16 @@ fn compact_json(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string())
 }
 
+fn short_hash(value: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(value.as_bytes());
+    let digest = hasher.finalize();
+    digest[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn model_dialogue_excerpt(text: &str) -> String {
     const MAX_CHARS: usize = 240;
     let normalized = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -861,8 +900,10 @@ pub async fn analyze_issue(
     cache_config: &CacheConfig,
     repo: &str,
     prompt_version: &str,
+    review_config: &ReviewConfig,
 ) -> IssueAnalysis {
     let config = resolve_provider_config(provider, model, base_url, api_key_env);
+    let cache_prompt_version = analysis_prompt_version(prompt_version, review_config);
     if !repo.is_empty() {
         if let Some(cached) = cache::get_cached_issue_analysis(
             cache_config,
@@ -870,14 +911,14 @@ pub async fn analyze_issue(
             issue_detail.issue.number,
             &config.provider,
             &config.model,
-            prompt_version,
+            &cache_prompt_version,
             ISSUE_SCHEMA_VERSION,
         ) {
             return issue_analysis_from_value(&cached);
         }
     }
 
-    let prompt = issue_prompt(issue_detail);
+    let prompt = issue_prompt(issue_detail, &review_config.system_prompt);
     let analysis = match generate(&config, &prompt).await {
         Ok(text) => extract_json(&text).map_or_else(
             || IssueAnalysis {
@@ -910,7 +951,7 @@ pub async fn analyze_issue(
             &serde_json::to_value(&analysis).unwrap_or_else(|_| json!({})),
             &config.provider,
             &config.model,
-            prompt_version,
+            &cache_prompt_version,
             ISSUE_SCHEMA_VERSION,
         );
     }
@@ -952,13 +993,13 @@ fn provider_by_name(provider: &str) -> Option<Box<dyn RestProvider + Send + Sync
     }
 }
 
-fn pr_prompt(pr_detail: &PrDetail) -> String {
+fn pr_prompt(pr_detail: &PrDetail, system_prompt: &str) -> String {
     let diff = if pr_detail.diff.len() > 15_000 {
         &pr_detail.diff[..15_000]
     } else {
         &pr_detail.diff
     };
-    PR_ANALYSIS_PROMPT
+    let prompt = PR_ANALYSIS_PROMPT
         .replace("{title}", &pr_detail.pr.title)
         .replace("{author}", &pr_detail.pr.author)
         .replace("{number}", &pr_detail.pr.number.to_string())
@@ -975,7 +1016,8 @@ fn pr_prompt(pr_detail: &PrDetail) -> String {
                 .collect::<Vec<_>>()
                 .join("\n"),
         )
-        .replace("{diff}", diff)
+        .replace("{diff}", diff);
+    apply_repo_system_prompt(prompt, system_prompt)
 }
 
 fn agentic_pr_prompt(
@@ -984,6 +1026,7 @@ fn agentic_pr_prompt(
     remaining_tool_calls: usize,
     min_tool_calls: usize,
     completed_tool_calls: usize,
+    system_prompt: &str,
 ) -> String {
     let diff = if pr_detail.diff.len() > 15_000 {
         &pr_detail.diff[..15_000]
@@ -996,7 +1039,7 @@ fn agentic_pr_prompt(
         .map(|f| format!("- {f}"))
         .collect::<Vec<_>>()
         .join("\n");
-    format!(
+    let prompt = format!(
         r#"You are lgtm, an expert code reviewer with read-only repository tools.
 
 Review this pull request. You must use at least {min_tool_calls} read-only repository tool calls before producing the final review when tool calls remain.
@@ -1061,10 +1104,11 @@ When ready, return exactly this final JSON object and no markdown:
         min_tool_calls = min_tool_calls,
         completed_tool_calls = completed_tool_calls,
         remaining_tool_calls = remaining_tool_calls,
-    )
+    );
+    apply_repo_system_prompt(prompt, system_prompt)
 }
 
-fn issue_prompt(issue_detail: &IssueDetail) -> String {
+fn issue_prompt(issue_detail: &IssueDetail, system_prompt: &str) -> String {
     let comments = if issue_detail.comments.is_empty() {
         "(no comments)".to_string()
     } else {
@@ -1076,7 +1120,7 @@ fn issue_prompt(issue_detail: &IssueDetail) -> String {
             .collect::<Vec<_>>()
             .join("\n\n")
     };
-    ISSUE_ANALYSIS_PROMPT
+    let prompt = ISSUE_ANALYSIS_PROMPT
         .replace("{title}", &issue_detail.issue.title)
         .replace("{author}", &issue_detail.issue.author)
         .replace("{number}", &issue_detail.issue.number.to_string())
@@ -1085,7 +1129,18 @@ fn issue_prompt(issue_detail: &IssueDetail) -> String {
             "{body}",
             empty_as(&issue_detail.issue.body, "(no description)"),
         )
-        .replace("{comments}", &comments)
+        .replace("{comments}", &comments);
+    apply_repo_system_prompt(prompt, system_prompt)
+}
+
+fn apply_repo_system_prompt(prompt: String, system_prompt: &str) -> String {
+    let system_prompt = system_prompt.trim();
+    if system_prompt.is_empty() {
+        return prompt;
+    }
+    format!(
+        "Repository-specific review instructions:\n{system_prompt}\n\nThese instructions are additive. Follow lgtm's required output format and tool protocol below.\n\n{prompt}"
+    )
 }
 
 pub fn extract_json(text: &str) -> Option<Value> {
@@ -1229,6 +1284,31 @@ mod tests {
         let long = model_dialogue_excerpt(&"a".repeat(300));
         assert_eq!(long.chars().count(), 240);
         assert!(long.ends_with("..."));
+    }
+
+    #[test]
+    fn includes_system_prompt_in_cache_version() {
+        let mut review = ReviewConfig {
+            system_prompt: "Focus on auth boundaries.".to_string(),
+            ..ReviewConfig::default()
+        };
+        let first = analysis_prompt_version("v3", &review);
+        assert!(first.starts_with("v3:system-prompt-"));
+        assert_eq!(first, analysis_prompt_version("v3", &review));
+
+        review.system_prompt = String::new();
+        assert_eq!(analysis_prompt_version("v3", &review), "v3");
+    }
+
+    #[test]
+    fn prepends_repo_system_prompt() {
+        let prompt = apply_repo_system_prompt("Base prompt".to_string(), "Focus on auth.");
+        assert!(prompt.starts_with("Repository-specific review instructions:\nFocus on auth."));
+        assert!(prompt.contains("Base prompt"));
+        assert_eq!(
+            apply_repo_system_prompt("Base prompt".to_string(), "   "),
+            "Base prompt"
+        );
     }
 
     #[test]

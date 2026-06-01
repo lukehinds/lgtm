@@ -66,6 +66,11 @@ columns = ["title", "author", "age", "label"]
 [review]
 enabled = true
 repo_path = "."
+system_prompt = """
+Focus on repository-specific review concerns here.
+"""
+# Or load instructions from a file relative to the working directory.
+# system_prompt_file = ".lgtm-review.md"
 min_tool_calls = 3
 max_tool_calls = 8
 max_tool_output_bytes = 12000
@@ -77,6 +82,14 @@ PR analysis uses read-only repo-context tools by default when `review.enabled`
 is true. The model must request at least `min_tool_calls` bounded tool calls
 before producing the final review. Available tools are `read_file`, `list_dir`,
 `grep`, `changed_files`, and `diff_for_file`.
+When cache is enabled, lgtm prepares a cached detached worktree for the PR head
+SHA and points these tools at that exact tree. If worktree preparation fails,
+it falls back to `review.repo_path`.
+Set `review.system_prompt` in a repo-local `lgtm.toml` to add repository-specific
+review instructions. These instructions are additive; lgtm still enforces its
+tool and JSON output protocol. You can also set `review.system_prompt_file` to
+load those instructions from a file relative to the working directory. If both
+are set, lgtm combines them.
 Set `max_tool_calls = 0` or `enabled = false` for diff-only analysis.
 
 ## CLI flags

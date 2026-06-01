@@ -31,8 +31,17 @@ columns = ["title", "author", "age", "label"]
 [review]
 # Enables read-only repo-context tools for PR analysis. Set max_tool_calls = 0
 # or enabled = false to use diff-only analysis.
+# When cache is enabled, PR reviews use a cached detached worktree for the PR
+# head SHA and fall back to repo_path if worktree preparation fails.
 enabled = true
 repo_path = "."
+# Optional repo-specific review instructions. These are additive; lgtm still
+# enforces its tool and JSON output protocol.
+# system_prompt = """
+# Pay extra attention to auth boundaries, sandboxing, and compatibility.
+# """
+# Or load the instructions from a file relative to the working directory.
+# system_prompt_file = ".lgtm-review.md"
 min_tool_calls = 3
 max_tool_calls = 8
 max_tool_output_bytes = 12000

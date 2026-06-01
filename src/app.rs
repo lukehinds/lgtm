@@ -43,7 +43,7 @@ use crate::{
         IssueAnalysis, IssueData, IssueDetail, IssueLabel, IssueSeverity, PrAnalysis, PrData,
         PrDetail, PrSize,
     },
-    sorting,
+    sorting, worktree,
 };
 
 // RGB text tiers — bypasses terminal ANSI palette remapping so these render
@@ -337,6 +337,8 @@ impl State {
                 self.apply_pr_sort(&mut prs);
                 self.prs = prs;
                 self.pr_total = total;
+                self.selected_pr = self.selected_pr.min(self.prs.len().saturating_sub(1));
+                self.status = "Pull requests loaded from cache".to_string();
                 return;
             }
         }
@@ -381,6 +383,8 @@ impl State {
                 self.apply_issue_sort(&mut issues);
                 self.issues = issues;
                 self.issue_total = total;
+                self.selected_issue = self.selected_issue.min(self.issues.len().saturating_sub(1));
+                self.status = "Issues loaded from cache".to_string();
                 return;
             }
         }
@@ -546,6 +550,8 @@ async fn load_pr_detail(
     let provider = resolved_provider(&config);
     let _ = phase_tx.send(format!("Checking cached PR #{} analysis...", pr.number));
     if !(config.review.enabled && config.review.max_tool_calls > 0) {
+        let prompt_version =
+            ai::pr_cache_prompt_version(&config.prompt_version, &config.review, false);
         if let Some(cached) = cache::get_cached_pr_analysis(
             &config.cache,
             &config.repo,
@@ -553,7 +559,7 @@ async fn load_pr_detail(
             &head_sha,
             &provider.provider,
             &provider.model,
-            &config.prompt_version,
+            &prompt_version,
             "pr-analysis-v1",
         ) {
             let _ = phase_tx.send(format!("Loading PR #{} metadata...", pr.number));
@@ -573,6 +579,29 @@ async fn load_pr_detail(
         .get_pr_detail(pr.number)
         .await
         .map_err(|err| format!("Failed to load PR: {err}"))?;
+    if config.review.enabled && config.review.max_tool_calls > 0 {
+        let worktree_prompt_version = ai::pr_cache_prompt_version(
+            &format!("{}:worktree", config.prompt_version),
+            &config.review,
+            true,
+        );
+        if let Some(cached) = cache::get_cached_pr_analysis(
+            &config.cache,
+            &config.repo,
+            detail.pr.number,
+            &detail.pr.head_sha,
+            &provider.provider,
+            &provider.model,
+            &worktree_prompt_version,
+            ai::AGENTIC_PR_SCHEMA_VERSION,
+        ) {
+            return Ok(DetailLoadResult::Pr {
+                detail,
+                analysis: ai::pr_analysis_from_value(&cached),
+                status: "PR analysis loaded from cache".to_string(),
+            });
+        }
+    }
     let mode = if config.review.enabled && config.review.max_tool_calls > 0 {
         "with repo context"
     } else {
@@ -594,6 +623,44 @@ async fn load_pr_detail(
     } else {
         let _ = phase_tx.send("log:Diff-only review mode".to_string());
     }
+    let mut review_config = config.review.clone();
+    let mut analysis_prompt_version = config.prompt_version.clone();
+    if review_config.enabled && review_config.max_tool_calls > 0 {
+        let _ = phase_tx.send("status:Preparing cached PR worktree...".to_string());
+        let _ = phase_tx.send("log:Preparing cached PR worktree".to_string());
+        let cache_config = config.cache.clone();
+        let repo = config.repo.clone();
+        let repo_path = review_config.repo_path.clone();
+        let pr_number = detail.pr.number;
+        let head_sha = detail.pr.head_sha.clone();
+        let worktree_result = tokio::task::spawn_blocking(move || {
+            worktree::prepare_pr_worktree(&cache_config, &repo, &repo_path, pr_number, &head_sha)
+        })
+        .await;
+        match worktree_result {
+            Ok(Ok(prepared)) => {
+                review_config.repo_path = prepared.path.display().to_string();
+                analysis_prompt_version = format!("{}:worktree", config.prompt_version);
+                let source = if prepared.reused { "reused" } else { "created" };
+                let _ = phase_tx.send(format!(
+                    "log:Cached PR worktree {source}: {}",
+                    prepared.path.display()
+                ));
+            }
+            Ok(Err(err)) => {
+                let _ = phase_tx.send(format!(
+                    "log:Cached PR worktree unavailable: {err}; falling back to {}",
+                    review_config.repo_path
+                ));
+            }
+            Err(err) => {
+                let _ = phase_tx.send(format!(
+                    "log:Cached PR worktree task failed: {err}; falling back to {}",
+                    review_config.repo_path
+                ));
+            }
+        }
+    }
     let analysis = ai::analyze_pr(
         &detail,
         &config.provider,
@@ -602,8 +669,8 @@ async fn load_pr_detail(
         &config.api_key_env,
         &config.cache,
         &config.repo,
-        &config.prompt_version,
-        &config.review,
+        &analysis_prompt_version,
+        &review_config,
         Some(phase_tx.clone()),
     )
     .await;
@@ -621,6 +688,7 @@ async fn load_issue_detail(
     phase_tx: UnboundedSender<String>,
 ) -> std::result::Result<DetailLoadResult, String> {
     let provider = resolved_provider(&config);
+    let issue_prompt_version = ai::analysis_prompt_version(&config.prompt_version, &config.review);
     let _ = phase_tx.send(format!(
         "Checking cached issue #{} analysis...",
         issue.number
@@ -631,7 +699,7 @@ async fn load_issue_detail(
         issue.number,
         &provider.provider,
         &provider.model,
-        &config.prompt_version,
+        &issue_prompt_version,
         "issue-analysis-v1",
     ) {
         let _ = phase_tx.send(format!("Loading issue #{} metadata...", issue.number));
@@ -660,6 +728,7 @@ async fn load_issue_detail(
         &config.cache,
         &config.repo,
         &config.prompt_version,
+        &config.review,
     )
     .await;
     Ok(DetailLoadResult::Issue {
@@ -1221,8 +1290,8 @@ fn render_list(frame: &mut Frame<'_>, state: &mut State, area: ratatui::layout::
                     frame,
                     area,
                     &title,
-                    "No open pull requests were returned.",
-                    &state.status,
+                    empty_pr_message(state),
+                    empty_list_status(state, "Pull requests loaded"),
                 );
             } else {
                 frame.render_stateful_widget(
@@ -1279,8 +1348,8 @@ fn render_list(frame: &mut Frame<'_>, state: &mut State, area: ratatui::layout::
                     frame,
                     area,
                     &title,
-                    "No open issues were returned.",
-                    &state.status,
+                    empty_issue_message(state),
+                    empty_list_status(state, "Issues loaded"),
                 );
             } else {
                 frame.render_stateful_widget(
@@ -1320,6 +1389,30 @@ fn visible_pr_indices(state: &State, provider: &ai::ProviderConfig) -> Vec<usize
         .collect()
 }
 
+fn empty_pr_message(state: &State) -> &'static str {
+    if state.prs.is_empty() {
+        "No open pull requests were returned."
+    } else {
+        "No pull requests match the current filters."
+    }
+}
+
+fn empty_issue_message(state: &State) -> &'static str {
+    if state.issues.is_empty() {
+        "No open issues were returned."
+    } else {
+        "No issues match the current filters."
+    }
+}
+
+fn empty_list_status<'a>(state: &'a State, loaded_status: &'a str) -> &'a str {
+    if state.list_task.is_some() || is_busy_status(&state.status) {
+        &state.status
+    } else {
+        loaded_status
+    }
+}
+
 fn visible_issue_indices(state: &State, provider: &ai::ProviderConfig) -> Vec<usize> {
     state
         .issues
@@ -1339,6 +1432,19 @@ fn visible_issue_indices(state: &State, provider: &ai::ProviderConfig) -> Vec<us
 }
 
 fn pr_has_cached_analysis(state: &State, pr: &PrData, provider: &ai::ProviderConfig) -> bool {
+    let repo_context = state.config.review.enabled && state.config.review.max_tool_calls > 0;
+    let base_prompt_version = if repo_context {
+        format!("{}:worktree", state.config.prompt_version)
+    } else {
+        state.config.prompt_version.clone()
+    };
+    let prompt_version =
+        ai::pr_cache_prompt_version(&base_prompt_version, &state.config.review, repo_context);
+    let schema_version = if repo_context {
+        ai::AGENTIC_PR_SCHEMA_VERSION
+    } else {
+        "pr-analysis-v1"
+    };
     !pr.head_sha.is_empty()
         && cache::get_cached_pr_analysis(
             &state.config.cache,
@@ -1347,8 +1453,8 @@ fn pr_has_cached_analysis(state: &State, pr: &PrData, provider: &ai::ProviderCon
             &pr.head_sha,
             &provider.provider,
             &provider.model,
-            &state.config.prompt_version,
-            "pr-analysis-v1",
+            &prompt_version,
+            schema_version,
         )
         .is_some()
 }
@@ -1358,13 +1464,15 @@ fn issue_has_cached_analysis(
     issue: &IssueData,
     provider: &ai::ProviderConfig,
 ) -> bool {
+    let prompt_version =
+        ai::analysis_prompt_version(&state.config.prompt_version, &state.config.review);
     cache::get_cached_issue_analysis(
         &state.config.cache,
         &state.config.repo,
         issue.number,
         &provider.provider,
         &provider.model,
-        &state.config.prompt_version,
+        &prompt_version,
         "issue-analysis-v1",
     )
     .is_some()
@@ -2312,7 +2420,7 @@ fn render_info(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect
     };
     let provider = resolved_provider(&state.config);
     let text = format!(
-        "Repository: {}\nProvider: {}\nModel: {}\nBase URL: {}\nAPI Key Env: {}\nPrompt Version: {}\nCache Enabled: {}\nCache Dir: {}\nAnalysis TTL: {}d\nCache Max: {} MB\nList Cache TTL: {}s\nPoll Interval: {}s\nConfig:\n{}",
+        "Repository: {}\nProvider: {}\nModel: {}\nBase URL: {}\nAPI Key Env: {}\nPrompt Version: {}\nRepo System Prompt: {}\nRepo System Prompt File: {}\nCache Enabled: {}\nCache Dir: {}\nAnalysis TTL: {}d\nCache Max: {} MB\nList Cache TTL: {}s\nPoll Interval: {}s\nConfig:\n{}",
         state.config.repo,
         provider.provider,
         provider.model,
@@ -2323,6 +2431,16 @@ fn render_info(frame: &mut Frame<'_>, state: &State, area: ratatui::layout::Rect
             &provider.api_key_env
         },
         state.config.prompt_version,
+        if state.config.review.system_prompt.trim().is_empty() {
+            "(none)"
+        } else {
+            "(set)"
+        },
+        if state.config.review.system_prompt_file.trim().is_empty() {
+            "(none)"
+        } else {
+            &state.config.review.system_prompt_file
+        },
         state.config.cache.enabled,
         cache::cache_dir(&state.config.cache).display(),
         state.config.cache.analysis_ttl_days,

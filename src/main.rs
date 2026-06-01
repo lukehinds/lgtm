@@ -5,6 +5,7 @@ mod config;
 mod github;
 mod models;
 mod sorting;
+mod worktree;
 
 use std::{env, path::PathBuf};
 
@@ -98,6 +99,22 @@ async fn main() -> Result<()> {
         println!("ui.columns = {}", config.ui.columns.join(", "));
         println!("review.enabled = {}", config.review.enabled);
         println!("review.repo_path = {}", config.review.repo_path);
+        println!(
+            "review.system_prompt_file = {}",
+            if config.review.system_prompt_file.trim().is_empty() {
+                "(none)"
+            } else {
+                &config.review.system_prompt_file
+            }
+        );
+        println!(
+            "review.system_prompt = {}",
+            if config.review.system_prompt.trim().is_empty() {
+                "(none)"
+            } else {
+                "(set)"
+            }
+        );
         println!("review.min_tool_calls = {}", config.review.min_tool_calls);
         println!("review.max_tool_calls = {}", config.review.max_tool_calls);
         println!(
