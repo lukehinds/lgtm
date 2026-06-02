@@ -1,0 +1,162 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.1.0)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+
+jobs:
+  # ── Build per-target binaries (and a .deb on x86_64 Linux) ─────────────────
+  build:
+    if: github.repository == 'lukehinds/lgtm'
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 — use 22.04 for broader glibc compatibility
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          # macOS x86_64 (Intel)
+          - target: x86_64-apple-darwin
+            os: macos-13
+          # macOS aarch64 (Apple Silicon)
+          - target: aarch64-apple-darwin
+            os: macos-14
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Package tarball
+        shell: bash
+        run: |
+          cd "target/${{ matrix.target }}/release"
+          tar czvf "../../../lgtm-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" lgtm
+          cd ../../..
+
+      - name: Install cargo-deb (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo install cargo-deb
+
+      - name: Build .deb (Linux x86_64)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          cargo deb --deb-version "$VERSION"
+
+      - name: Stage artifacts
+        shell: bash
+        run: |
+          mkdir -p artifact_staging
+          cp "lgtm-${RELEASE_TAG}-${{ matrix.target }}.tar.gz" artifact_staging/
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-gnu" ] && [ -d target/debian ]; then
+            cp target/debian/*.deb artifact_staging/
+          fi
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: lgtm-${{ matrix.target }}
+          path: artifact_staging
+
+  # ── Create the GitHub release with all built artifacts ─────────────────────
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate checksums
+        run: |
+          cd artifacts
+          sha256sum *.tar.gz *.deb > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          draft: false
+          generate_release_notes: true
+          files: |
+            artifacts/*.tar.gz
+            artifacts/*.deb
+            artifacts/SHA256SUMS.txt
+
+  # ── Publish to crates.io with the registry token sealed by runseal ─────────
+  publish-crates:
+    name: Publish to crates.io
+    needs: build
+    runs-on: ubuntu-latest  # runseal requires a Linux x86_64 runner
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+
+      # cargo publish runs a verification BUILD, which executes the build.rs and
+      # proc-macros of every transitive dependency. runseal seals
+      # CARGO_REGISTRY_TOKEN so that untrusted dependency code cannot read it:
+      # the child process sees only a phantom token, and the nono proxy injects
+      # the real value solely on the crates.io upload request.
+      - name: Publish lgtm
+        uses: always-further/runseal@main
+        with:
+          run: cargo publish --allow-dirty
+          audit: artifact
+          policy: |
+            fs:
+              read:
+                - "."
+                - "$HOME/.cargo"
+                - "$HOME/.rustup"
+              write:
+                - "./target"
+                - "$HOME/.cargo"
+            network:
+              mode: filtered
+              allow:
+                - index.crates.io     # sparse index metadata (unauthenticated)
+                - static.crates.io    # dependency .crate downloads for the verify build
+            access:
+              cratesio:
+                secret: CARGO_REGISTRY_TOKEN
+                url: https://crates.io
+                inject:
+                  mode: header
+                allow:
+                  - PUT /api/v1/crates/new
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
