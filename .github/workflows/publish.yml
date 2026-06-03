@@ -32,8 +32,8 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-22.04
           # macOS x86_64 (Intel)
-          - target: x86_64-apple-darwin
-            os: macos-13
+          #- target: x86_64-apple-darwin
+          #  os: macos-13
           # macOS aarch64 (Apple Silicon)
           - target: aarch64-apple-darwin
             os: macos-14
