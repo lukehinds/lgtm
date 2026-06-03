@@ -126,6 +126,9 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
+      - name: Prepare publish workspace
+        run: mkdir -p target
+
       # cargo publish runs a verification BUILD, which executes the build.rs and
       # proc-macros of every transitive dependency. runseal seals
       # CARGO_REGISTRY_TOKEN so that untrusted dependency code cannot read it:
@@ -145,6 +148,7 @@ jobs:
                 - "/home/runner/.rustup"
               write:
                 - "./target"
+                - "./Cargo.lock"
                 - "/home/runner/.cargo"
             network:
               mode: filtered
