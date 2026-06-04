@@ -127,7 +127,7 @@ jobs:
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
 
       - name: Prepare publish workspace
-        run: mkdir -p target
+        run: mkdir -p target/tmp
 
       # cargo publish runs a verification BUILD, which executes the build.rs and
       # proc-macros of every transitive dependency. runseal seals
@@ -138,7 +138,7 @@ jobs:
         uses: always-further/runseal@main
         with:
           runseal-version: source
-          run: cargo publish --allow-dirty
+          run: TMPDIR="$PWD/target/tmp" cargo publish --allow-dirty
           audit: artifact
           policy: |
             fs:
